@@ -372,6 +372,7 @@ checkpoint 数量和存储格式均可配（`n_traj_ckpt`、`ckpt_dtype`）。
 ```
 llmlab/
 ├── data/               # 生成的数据集 *.jsonl (文件名体现该数据集的部分关键配置)
+├── fig/                # 生成的图表 *.png (文件名体现该图表的部分关键配置)
 ├── config/             # 每个 stage 一个 yaml 超参文件
 │   ├── teacher_pretrain.yaml    # teacher pretrain 所有超参 (所用数据集配置, model 超参, pretrain 配置, 输出 pt path 等)
 │   ├── teacher_sft.yaml         # teacher sft 所有超参 (所用数据集配置, base model pt path, SFT 配置, 输出 pt path 等)
