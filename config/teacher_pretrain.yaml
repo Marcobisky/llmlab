@@ -28,13 +28,15 @@ model:
   activation: gelu
 
 train:
-  lr: 3.0e-4
-  lr_schedule: cosine             # cosine | constant
-  batch_size: 128
-  n_steps: 3000
-  warmup_steps: 200
+  lr: 1.0e-3
+  lr_schedule: cosine             # cosine | constant；LR 衰减到 lr*0.1（不砸 0）
+  batch_size: 1024                # A5000 24GB，teacher 2.67M 参数可轻松跑 1024
+  n_steps: 8000                  # 50k / 1024 ≈ 49 steps/epoch → 约 163 epoch
+  warmup_steps: 400
   weight_decay: 0.1
-  grad_clip: 1.0
+  grad_clip: 2.0                  # 原 1.0 裁剪太激进（gnorm 常 5-30）
+  amp: true                       # AMP float16，tensor core 加速
+  compile: true                   # torch.compile()（PyTorch ≥ 2.0）
   seed: 42
   device: cuda
 
@@ -43,7 +45,7 @@ output:
   log_dir: log/teacher_pretrain/
 
 logging:
-  log_every: 50
+  log_every: 200                  # 步数多了，降低 eval 频率
   eval_batch_size: 256
   eval_data_path: data/eval.jsonl
   n_traj_ckpt: 30

@@ -28,13 +28,15 @@ model:
   activation: gelu
 
 train:
-  lr: 3.0e-4
+  lr: 1.0e-3
   lr_schedule: cosine
-  batch_size: 64
-  n_steps: 3000
-  warmup_steps: 200
+  batch_size: 1024                # student 0.15M 参数，batch 1024 显存开销很小
+  n_steps: 8000                  # 50k / 1024 ≈ 49 steps/epoch → 约 163 epoch
+  warmup_steps: 400
   weight_decay: 0.1
-  grad_clip: 1.0
+  grad_clip: 2.0
+  amp: true
+  compile: true
   seed: 42
   device: cuda
 
@@ -43,7 +45,7 @@ output:
   log_dir: log/student_pretrain/
 
 logging:
-  log_every: 50
+  log_every: 200
   eval_batch_size: 256
   eval_data_path: data/eval.jsonl
   n_traj_ckpt: 30
