@@ -1,0 +1,51 @@
+data:
+  path: data/student_sft.jsonl    # teacher 在这些 prompt 上 rollout
+  split: student_train
+  depth_range: [0, 5]
+  seed: 42
+
+model:
+  vocab_size: 34
+  context_len: 48
+  d_model: 64
+  n_layers: 3
+  n_heads: 4
+  d_head: 16
+  d_ffn: 256
+  dropout: 0.0
+  tie_embedding: true
+  pos_embedding: learned
+  norm_type: pre_ln
+  activation: gelu
+
+train:
+  base_model_path: model/student_sft.pt
+  teacher_model_path: model/teacher_final.pt
+  lr: 1.0e-4
+  lr_schedule: cosine
+  batch_size: 64
+  n_steps: 800
+  warmup_steps: 80
+  weight_decay: 0.0
+  grad_clip: 1.0
+  kl_direction: forward           # forward | reverse
+  temperature: 1.0                # softmax 温度（蒸馏时平滑 logits）
+  alpha_ce: 0.0                   # CE loss 混合比（0 = 纯 KL）
+  loss_on_prompt: false
+  seed: 42
+  device: cuda
+
+output:
+  model_path: model/student_kd.pt
+  log_dir: log/student_kd/
+
+logging:
+  log_every: 50
+  eval_batch_size: 256
+  eval_data_path: data/eval.jsonl
+  n_traj_ckpt: 30
+  ckpt_dtype: float16
+  tmp_ckpt_dir: tmp/student_kd/
+  grid_res: 31
+  landscape_alpha_range: [-1.0, 1.0]
+  landscape_beta_range: [-1.0, 1.0]
