@@ -36,6 +36,7 @@ train:
   weight_decay: 0.1
   grad_clip: 2.0
   amp: true
+  amp_dtype: bf16
   compile: true
   seed: 42
   device: cuda

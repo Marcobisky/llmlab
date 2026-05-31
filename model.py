@@ -29,41 +29,40 @@ class CausalSelfAttention(nn.Module):
     """
     def __init__(self, d_model: int, n_heads: int, d_head: int, dropout: float):
         super().__init__()
-        self.n_heads = n_heads          # H
-        self.d_head  = d_head           # d_h
-        d_inner = n_heads * d_head      # H * d_h
+        self.n_heads    = n_heads
+        self.d_head     = d_head
+        self.dropout    = dropout       # 传给 scaled_dot_product_attention
+        d_inner = n_heads * d_head
 
-        self.qkv  = nn.Linear(d_model, 3 * d_inner, bias=False)  # → [B,T, 3*H*d_h]
-        self.proj = nn.Linear(d_inner, d_model,      bias=False)  # → [B,T, D]
-        self.attn_drop = nn.Dropout(dropout)
+        self.qkv        = nn.Linear(d_model, 3 * d_inner, bias=False)
+        self.proj       = nn.Linear(d_inner, d_model,      bias=False)
         self.resid_drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B=batch, T=seq_len, D=d_model]
+        # x: [B, T, D]
         B, T, D = x.shape
         H, dh   = self.n_heads, self.d_head
 
-        qkv = self.qkv(x)                       # [B, T, 3*H*dh]
-        q, k, v = qkv.split(H * dh, dim=-1)     # each [B, T, H*dh]
+        qkv = self.qkv(x)                          # [B, T, 3*H*dh]
+        q, k, v = qkv.split(H * dh, dim=-1)
 
-        # reshape to [B, H, T, dh] for multi-head attention
-        q = q.view(B, T, H, dh).transpose(1, 2)  # [B, H, T, dh]
-        k = k.view(B, T, H, dh).transpose(1, 2)  # [B, H, T, dh]
-        v = v.view(B, T, H, dh).transpose(1, 2)  # [B, H, T, dh]
+        q = q.view(B, T, H, dh).transpose(1, 2)   # [B, H, T, dh]
+        k = k.view(B, T, H, dh).transpose(1, 2)
+        v = v.view(B, T, H, dh).transpose(1, 2)
 
-        # Scaled dot-product attention with causal mask
-        scale = dh ** -0.5
-        attn = (q @ k.transpose(-2, -1)) * scale   # [B, H, T, T]
-        causal_mask = torch.triu(
-            torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
-        )
-        attn = attn.masked_fill(causal_mask, float('-inf'))
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_drop(attn)
+        # Flash Attention（PyTorch ≥ 2.0 在 Ampere+ GPU 上自动走 FlashAttn kernel）：
+        #   - 无需显式构造 [T,T] causal mask（省去 O(T²) 显存分配）
+        #   - IO-aware 分块计算，显存带宽利用率显著高于手写 attention
+        #   - is_causal=True 等价于上三角 mask（下三角有效位置）
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=True,
+        )                                           # [B, H, T, dh]
 
-        out = attn @ v                              # [B, H, T, dh]
-        out = out.transpose(1, 2).contiguous().view(B, T, H * dh)  # [B, T, H*dh]
-        return self.resid_drop(self.proj(out))      # [B, T, D]
+        out = out.transpose(1, 2).contiguous().view(B, T, H * dh)
+        return self.resid_drop(self.proj(out))
 
 
 class FFN(nn.Module):

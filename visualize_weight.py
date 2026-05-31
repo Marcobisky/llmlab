@@ -51,42 +51,53 @@ def plot_one_landscape(ax, ld: dict, stage: str):
     """
     在给定 Axes 上绘制 loss landscape + 轨迹。
 
-    landscape 坐标系说明：
-      alpha_grid / beta_grid  → 两个 PCA 主方向的系数
-      (0, 0) 对应 theta*（训练终点），即图中心
-      轨迹点 (traj_alpha[i], traj_beta[i]) 是各临时 checkpoint 在该平面的投影
+    坐标系：(0,0) = theta*（训练终点）；等高线范围自动扩展覆盖完整轨迹。
+
+    兼容两种 npz：
+      - 新版（save_landscape 自动定范围）：网格已覆盖轨迹
+      - 旧版（固定 ±1 范围）：轴范围扩展到轨迹，等高线只绘制网格区域内
     """
     ag = ld['alpha_grid']   # [grid_res]
     bg = ld['beta_grid']    # [grid_res]
-    Z  = ld['Z']            # [grid_res, grid_res]，行对应 alpha，列对应 beta
-    ta = ld['traj_alpha']   # [N] 轨迹点 alpha 坐标
-    tb = ld['traj_beta']    # [N] 轨迹点 beta 坐标
+    Z  = ld['Z']            # [grid_res, grid_res]
+    ta = ld['traj_alpha']   # [N]
+    tb = ld['traj_beta']    # [N]
 
-    # 等高线（对数 Z 让低谷更清晰）
-    Z_plot = np.log1p(Z - Z.min())   # shift to ≥0 then log1p
+    # ── 等高线（对数压缩让低谷更清晰）──────────────────────────────────────
+    Z_plot = np.log1p(Z - Z.min())
+    levels = np.linspace(Z_plot.min(), Z_plot.max(), 20)
 
-    n_levels = 20
-    levels = np.linspace(Z_plot.min(), Z_plot.max(), n_levels)
-
-    # pcolormesh background + contour lines
-    B, A = np.meshgrid(bg, ag)   # A[i,j]=ag[i], B[i,j]=bg[j]
+    B, A = np.meshgrid(bg, ag)
     cf = ax.contourf(B, A, Z_plot, levels=levels, cmap='RdYlGn_r', alpha=0.85)
     ax.contour(B, A, Z_plot, levels=levels[::4], colors='k', linewidths=0.4, alpha=0.5)
-    plt.colorbar(cf, ax=ax, label='log(1+loss−min)', shrink=0.85)
+    plt.colorbar(cf, ax=ax, label='log(1+L−Lmin)', shrink=0.82, pad=0.02)
 
-    # 轨迹（蓝色折线 + 点，按时间顺序）
+    # ── 轨迹 ────────────────────────────────────────────────────────────────
     if len(ta) > 0:
-        ax.plot(tb, ta, 'o-', color='royalblue', markersize=4,
-                linewidth=1.2, label='Training trajectory', zorder=3)
-        # 起点（最早 checkpoint）
-        ax.scatter(tb[0], ta[0], color='cyan', s=60, zorder=4, label='Start')
-    # 终点 = theta*，对应原点 (0,0)
+        ax.plot(tb, ta, 'o-', color='royalblue', markersize=3,
+                linewidth=1.0, label='Trajectory', zorder=3)
+        ax.scatter(tb[0], ta[0], color='cyan',  s=50, zorder=4, label='Start')
     ax.scatter([0], [0], color='red', s=80, marker='*', zorder=5, label='θ* (end)')
 
-    ax.set_xlabel('β (PC2 direction)')
-    ax.set_ylabel('α (PC1 direction)')
+    # ── 自动轴范围：覆盖网格 + 轨迹，加 5% 边距 ───────────────────────────
+    all_b = np.concatenate([bg, tb]) if len(tb) else bg
+    all_a = np.concatenate([ag, ta]) if len(ta) else ag
+    def _lim(vals, margin=0.05):
+        lo, hi = vals.min(), vals.max()
+        pad = (hi - lo) * margin if hi > lo else 1.0
+        return lo - pad, hi + pad
+    ax.set_xlim(_lim(all_b))
+    ax.set_ylim(_lim(all_a))
+
+    # 用虚线框标出实际网格边界（若轨迹超出网格才有意义）
+    rect_b = [bg.min(), bg.max(), bg.max(), bg.min(), bg.min()]
+    rect_a = [ag.min(), ag.min(), ag.max(), ag.max(), ag.min()]
+    ax.plot(rect_b, rect_a, 'k--', linewidth=0.7, alpha=0.4, label='Grid boundary')
+
+    ax.set_xlabel('β (PC2)')
+    ax.set_ylabel('α (PC1)')
     ax.set_title(stage)
-    ax.legend(fontsize=6, loc='upper right')
+    ax.legend(fontsize=6, loc='best')
 
 
 # ─────────────────────────────────────────────────────────────────────────────

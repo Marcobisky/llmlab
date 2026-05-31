@@ -8,7 +8,7 @@ data:
   ops_enabled: all
   check_fraction: 0.15
   verdict_ratio: [5, 3, 2]        # vc : vw : gw
-  cot_fraction: 0.2               # teacher pretrain 启用 CoT
+  cot_fraction: 0.1               # 从 0.2 降到 0.1：CoT 轨迹长、loss 大，过多会压制直接任务学习
   vw_corruption: swap             # swap | replace | truncate | shuffle
   noise_rate: 0.0
   seed: 42
@@ -21,7 +21,7 @@ model:
   n_heads: 6
   d_head: 32
   d_ffn: 768
-  dropout: 0.0
+  dropout: 0.1                    # 0.0→0.1：val-train gap 从 0.09 升到 0.70，过拟合明显
   tie_embedding: true
   pos_embedding: learned          # learned | sinusoidal
   norm_type: pre_ln
@@ -31,12 +31,13 @@ train:
   lr: 1.0e-3
   lr_schedule: cosine             # cosine | constant；LR 衰减到 lr*0.1（不砸 0）
   batch_size: 1024                # A5000 24GB，teacher 2.67M 参数可轻松跑 1024
-  n_steps: 8000                  # 50k / 1024 ≈ 49 steps/epoch → 约 163 epoch
-  warmup_steps: 400
+  n_steps: 20000                 # 8000→20000：acc 在 8000 步时仍在上升（d3=47%），需要更多训练
+  warmup_steps: 800              # 步数翻倍，warmup 同比延长
   weight_decay: 0.1
   grad_clip: 2.0                  # 原 1.0 裁剪太激进（gnorm 常 5-30）
-  amp: true                       # AMP float16，tensor core 加速
-  compile: true                   # torch.compile()（PyTorch ≥ 2.0）
+  amp: true
+  amp_dtype: bf16                 # bf16：Ampere+ 原生支持，范围同 FP32，无需 GradScaler
+  compile: true                   # torch.compile(mode="reduce-overhead")
   seed: 42
   device: cuda
 
@@ -45,7 +46,7 @@ output:
   log_dir: log/teacher_pretrain/
 
 logging:
-  log_every: 200                  # 步数多了，降低 eval 频率
+  log_every: 400                  # n_steps 翻倍，eval 频率同比降低，保持 50 个 log 点
   eval_batch_size: 256
   eval_data_path: data/eval.jsonl
   n_traj_ckpt: 30

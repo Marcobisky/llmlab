@@ -192,6 +192,14 @@ def main(config_path: str):
         device = 'cpu'
         print("⚠ CUDA 不可用，回退到 CPU")
 
+    # ── NVIDIA GPU 专项设置 ────────────────────────────────────────────────
+    if device == 'cuda':
+        # TF32：Ampere+ 对 FP32 matmul 用 TF32 加速（精度影响极小，PyTorch 默认已开启）
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32       = True
+        # 让 PyTorch 自动选择最快的 cuDNN 卷积算法（对固定尺寸输入有效）
+        torch.backends.cudnn.benchmark        = True
+
     seed = train_cfg.get('seed', 42)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -204,7 +212,11 @@ def main(config_path: str):
     lr_schedule  = train_cfg.get('lr_schedule', 'cosine')
     weight_decay = train_cfg.get('weight_decay', 0.1)
     grad_clip    = train_cfg.get('grad_clip', 2.0)
-    use_amp      = train_cfg.get('amp', True) and device == 'cuda'
+    # amp_dtype: bf16（推荐 Ampere+）或 fp16（旧 GPU）
+    # BF16 优势：动态范围与 FP32 相同，无需 GradScaler，训练稳定性更好
+    _amp_dtype_str = train_cfg.get('amp_dtype', 'bf16')
+    _amp_dtype     = torch.bfloat16 if _amp_dtype_str == 'bf16' else torch.float16
+    use_amp        = train_cfg.get('amp', True) and device == 'cuda'
     log_every    = log_cfg['log_every']
     eval_bs      = log_cfg['eval_batch_size']
     n_traj_ckpt = log_cfg['n_traj_ckpt']
@@ -236,7 +248,8 @@ def main(config_path: str):
     # torch.compile：若可用则启用，对小模型约有 30-50% 额外提速
     if train_cfg.get('compile', True) and hasattr(torch, 'compile'):
         print("  torch.compile() 编译中（首次 step 会慢）...")
-        model = torch.compile(model)
+        # reduce-overhead：减少 Python/CUDA kernel launch 开销，对小模型效果最好
+        model = torch.compile(model, mode="reduce-overhead")
 
     # ── GPU 数据预加载 ───────────────────────────────────────────────────────
     data_path = data_cfg['path']
@@ -266,19 +279,23 @@ def main(config_path: str):
     eval_batch = make_eval_batch(eval_records, context_len, eval_bs, device)
     # eval_batch: (inp [B, C-1], lbl [B, C-1])，固定不变
 
-    # ── 优化器 + AMP ────────────────────────────────────────────────────────
+    # ── 优化器 ──────────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95)
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    # BF16 不需要 GradScaler（动态范围足够，不会 underflow）
+    # FP16 仍需 scaler，保留以兼容旧配置
+    scaler = (torch.cuda.amp.GradScaler()
+              if use_amp and _amp_dtype == torch.float16 else None)
 
     # ── 训练循环 ─────────────────────────────────────────────────────────────
     metrics_path = Path(log_dir) / "metrics.jsonl"
     metrics_file = open(metrics_path, 'w')
 
-    prev_flat: Optional[np.ndarray] = None
-    grad_norm_val = 0.0
-    t_start = time.time()
+    prev_flat: Optional[np.ndarray]  = None
+    grad_norm_t: Optional[torch.Tensor] = None   # 不在热路径调 .item()，只在 log 时拉取
+    t_start    = time.time()
+    t_interval = t_start                          # 用于计算区间（而非累计）吞吐
 
     n_epoch_steps = max(1, buf.N // batch_size)  # 每 epoch 步数（仅用于显示）
     print(f"\n{'='*60}")
@@ -301,20 +318,24 @@ def main(config_path: str):
         # labels:  [B, T]，-100 位置被 CE 忽略
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast(device_type='cuda' if device == 'cuda' else 'cpu',
-                                 enabled=use_amp):
+
+        with torch.amp.autocast(
+            device_type='cuda' if device == 'cuda' else 'cpu',
+            dtype=_amp_dtype, enabled=use_amp
+        ):
             _, loss = model(inp_ids, labels)
 
-        scaler.scale(loss).backward()
-
-        # unscale 后再裁剪，保证 grad_norm 是真实值
-        scaler.unscale_(optimizer)
-        grad_norm_val = nn.utils.clip_grad_norm_(
-            model.parameters(), grad_clip
-        ).item()
-
-        scaler.step(optimizer)
-        scaler.update()
+        if scaler is not None:          # FP16 路径
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            grad_norm_t = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:                           # BF16 / 无 AMP 路径：省去 Scaler 开销
+            loss.backward()
+            grad_norm_t = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+        # ↑ 不调 .item()，避免每步强制 CPU-GPU 同步（热路径关键！）
 
         # ── 保存 tmp checkpoint ─────────────────────────────────────────
         if step % ckpt_interval == 0 or step == 1:
@@ -322,11 +343,15 @@ def main(config_path: str):
 
         # ── 指标记录 ────────────────────────────────────────────────────
         if step % log_every == 0 or step == n_steps:
-            # 计算吞吐：tokens/s
-            elapsed   = time.time() - t_start
-            tps       = step * batch_size * (context_len - 1) / elapsed
+            # 区间吞吐（本 log_every 步的实际速度，排除上一区间的 eval 开销）
+            # 此处首次出现 .item()，触发一次 CPU-GPU 同步（每 log_every 步一次）
+            now         = time.time()
+            interval_s  = now - t_interval
+            t_interval  = now
+            tps         = log_every * batch_size * (context_len - 1) / interval_s
 
-            # 取原始模型（compile 包装后需通过 _orig_mod）
+            grad_norm_val = grad_norm_t.item() if grad_norm_t is not None else 0.0
+
             raw_model = getattr(model, '_orig_mod', model)
             m, prev_flat = compute_metrics(
                 model            = raw_model,
@@ -344,8 +369,8 @@ def main(config_path: str):
             print(
                 f"step {step:6d}/{n_steps} | lr={cur_lr:.2e} | "
                 f"loss={m['train_loss']:.4f} | val={m['val_loss']:.4f} | "
-                f"acc={m['task_acc']:.3f} | gnorm={m['grad_norm']:.2f} | "
-                f"{tps/1000:.1f}k tok/s"
+                f"acc={m['task_acc']:.3f} | gnorm={grad_norm_val:.2f} | "
+                f"{tps/1000:.1f}k tok/s (interval)"
             )
 
     metrics_file.close()

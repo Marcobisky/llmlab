@@ -69,10 +69,32 @@ def greedy_decode(
 # 任务正确率（按 depth 分）
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _extract_result(toks: List[str]) -> str:
+    """
+    从生成的 token 序列中提取最终数字结果，兼容两种格式：
+
+    直接格式：'= 1 2 3 [EOS]'
+    CoT 格式：'<think> ... </think> = 1 2 3 [EOS]'
+
+    策略：找序列中最后一个 '='，取其后到 '[EOS]' 为止的 token 拼成字符串。
+    最后一个 '=' 一定是 "= RESULT [EOS]" 中的那个（CoT trace 内部的 '=' 都在
+    </think> 之前，所以 </think> 后只剩一个 '='）。
+    """
+    last_eq = max((i for i, t in enumerate(toks) if t == '='), default=-1)
+    if last_eq < 0:
+        return ''
+    parts = []
+    for t in toks[last_eq + 1:]:
+        if t == '[EOS]':
+            break
+        parts.append(t)
+    return ''.join(parts)
+
+
 @torch.no_grad()
 def compute_task_acc(
     model,
-    eval_records: List[Dict],   # eval.jsonl 中的记录列表（已过滤为 stmt 类型）
+    eval_records: List[Dict],
     token2id: Dict[str, int],
     id2tok: Dict[int, str],
     eos_id: int,
@@ -80,51 +102,71 @@ def compute_task_acc(
     max_depth: int = 5,
 ) -> Tuple[float, List[float]]:
     """
-    对 eval_records（stmt 类型）做贪心解码，用解释器判断正确性。
-    返回 (overall_acc, acc_by_depth[0..max_depth])。
+    批量贪心解码，按 prompt 长度分组，同组内合并成一个 batch 一起前向。
 
-    判断逻辑：
-      - prompt = '[BOS] EXPR'，model 应生成 '= RESULT [EOS]'
-      - 从生成序列里提取 RESULT（'=' 之后到 '[EOS]' 之前的数字 token 拼接）
-      - 与 record['result'] 比对
+    原来的做法：N 条 stmt × max_new 步 × batch=1 = N*max_new 次顺序前向
+    现在的做法：按 prompt 长度分 K 组（同长无需 padding），每组 max_new 步 × batch=B_k
+               总前向次数 ≈ K * max_new，B_k 远大于 1，GPU 利用率显著提升。
+
+    对 166 条 stmt（eval_bs=256 中的占比）：
+      原：166×15 = 2490 次 batch=1 前向  ≈ 7-11 秒
+      新：~15组 × 15步  = 225 次 batch≈11 前向 ≈ 0.3-0.7 秒
     """
+    from collections import defaultdict
+
+    model.eval()
+    context_len = model.pos_emb.num_embeddings  # 48
+
+    stmt_recs = [r for r in eval_records
+                 if r.get('type') == 'stmt' and r.get('depth', 0) <= max_depth]
+    if not stmt_recs:
+        return 0.0, [0.0] * (max_depth + 1)
+
+    # 按 prompt token 数分组（同长 → 直接 stack，无需 padding）
+    by_len: Dict[int, list] = defaultdict(list)
+    for rec in stmt_recs:
+        p = [token2id[t] for t in rec['prompt'].split() if t in token2id]
+        by_len[len(p)].append((p, rec))
+
     correct_by_depth = [0] * (max_depth + 1)
     total_by_depth   = [0] * (max_depth + 1)
 
-    stmt_recs = [r for r in eval_records if r.get('type') == 'stmt']
+    for prompt_len, items in by_len.items():
+        batch_p   = [x[0] for x in items]   # List[List[int]]，每条长 prompt_len
+        batch_rec = [x[1] for x in items]
+        B = len(batch_p)
 
-    for rec in stmt_recs:
-        depth = rec.get('depth', 0)
-        if depth > max_depth:
-            continue
+        # [B, prompt_len]，同长直接 stack，零 padding
+        ids  = torch.tensor(batch_p, dtype=torch.long, device=device)
+        done = torch.zeros(B, dtype=torch.bool, device=device)
+        gen  = [[] for _ in range(B)]       # gen[b] = 已生成 token id 列表
 
-        prompt_ids = [token2id[t] for t in rec['prompt'].split()
-                      if t in token2id]
-        generated  = greedy_decode(model, prompt_ids, eos_id,
-                                   max_new=32, device=device)
-        gen_toks   = [id2tok.get(i, '?') for i in generated]
+        for _ in range(32):                 # max_new
+            if done.all() or ids.shape[1] >= context_len:
+                break
+            logits = model(ids)             # [B, T, V]
+            nxt    = logits[:, -1].argmax(dim=-1)   # [B]  — 贪心取 argmax
+            ids    = torch.cat([ids, nxt.unsqueeze(1)], dim=1)  # [B, T+1]
 
-        # 解析：'= t1 t2 ... [EOS]' → 拼出 result 字符串
-        decoded_result = ''
-        if gen_toks and gen_toks[0] == '=':
-            parts = []
-            for t in gen_toks[1:]:
-                if t == '[EOS]':
-                    break
-                parts.append(t)
-            decoded_result = ''.join(parts)  # 每个 part 是单字符数字 token
+            eos_hit = (nxt == eos_id)
+            for b in range(B):
+                if not done[b]:
+                    gen[b].append(nxt[b].item())
+                    if eos_hit[b]:
+                        done[b] = True
 
-        total_by_depth[depth] += 1
-        if decoded_result == rec['result']:
-            correct_by_depth[depth] += 1
+        # 解析每条生成结果（兼容直接输出和 CoT 输出）
+        for b, rec in enumerate(batch_rec):
+            depth  = rec.get('depth', 0)
+            toks   = [id2tok.get(i, '?') for i in gen[b]]
+            result = _extract_result(toks)
+            total_by_depth[depth]   += 1
+            correct_by_depth[depth] += int(result == rec['result'])
 
-    acc_by_depth = [
-        c / t if t > 0 else 0.0
-        for c, t in zip(correct_by_depth, total_by_depth)
-    ]
-    total_c = sum(correct_by_depth)
+    acc_by_depth = [c / t if t > 0 else 0.0
+                    for c, t in zip(correct_by_depth, total_by_depth)]
     total_t = sum(total_by_depth)
-    overall  = total_c / total_t if total_t > 0 else 0.0
+    overall = sum(correct_by_depth) / total_t if total_t > 0 else 0.0
     return overall, acc_by_depth
 
 
@@ -281,6 +323,20 @@ def save_landscape(
     # 投影各 checkpoint 到 (d1, d2) 平面（相对于 theta_star）
     traj_alpha = deltas @ d1  # [N]
     traj_beta  = deltas @ d2  # [N]
+
+    # 自动按轨迹范围定网格（覆盖完整轨迹 + 15% 边距），忽略 config 里的固定 ±1
+    # 这样 landscape 网格和轨迹始终对齐，不会出现轨迹在图外的问题
+    def _auto_range(vals: np.ndarray, pad_ratio: float = 0.15) -> Tuple[float, float]:
+        lo, hi  = float(vals.min()), float(vals.max())
+        span    = hi - lo if hi > lo else 1.0
+        pad     = span * pad_ratio
+        return lo - pad, hi + pad
+
+    alpha_range = _auto_range(traj_alpha)
+    beta_range  = _auto_range(traj_beta)
+    print(f"  [landscape] 轨迹范围 α=[{traj_alpha.min():.2f},{traj_alpha.max():.2f}] "
+          f"β=[{traj_beta.min():.2f},{traj_beta.max():.2f}]")
+    print(f"  [landscape] 网格范围  α={alpha_range}  β={beta_range}")
 
     # 构建网格，计算 loss
     alpha_vals = np.linspace(alpha_range[0], alpha_range[1], grid_res)
