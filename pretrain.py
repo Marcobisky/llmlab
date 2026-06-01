@@ -121,12 +121,15 @@ class GPUDataBuffer:
 
 
 def make_eval_batch(
-    eval_records: List[Dict], context_len: int, max_samples: int, device: str
+    eval_records: List[Dict], context_len: int, max_samples: int, device: str,
+    mode: str = 'sft',
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """把 eval 记录转成固定 batch（不 shuffle，用于稳定指标计算）。"""
+    """把 eval 记录转成固定 batch（不 shuffle，用于稳定 val_loss 计算）。
+    mode 应与训练保持一致，默认 'sft'（只对 target 算 loss）。
+    """
     all_inp, all_lbl = [], []
     for rec in eval_records[:max_samples]:
-        inp, lbl = _tokenize_record(rec, context_len, mode='pretrain')
+        inp, lbl = _tokenize_record(rec, context_len, mode=mode)
         all_inp.append(inp)
         all_lbl.append(lbl)
     inp_t = torch.tensor(all_inp, dtype=torch.long, device=device)  # [B, C-1]
@@ -253,7 +256,12 @@ def main(config_path: str):
 
     # ── GPU 数据预加载 ───────────────────────────────────────────────────────
     data_path = data_cfg['path']
-    buf = GPUDataBuffer(data_path, context_len, mode='pretrain', device=device)
+    # mode='sft'：prompt 部分 label=-100，只对 target（等号右边）计 loss。
+    # pretrain 与 SFT 的区别在于数据，而非 loss 的计算方式：
+    #   pretrain：stmt + check + cot 混合，数据多样，教模型所有句式的计算逻辑
+    #   SFT：只有 stmt（生成任务），专注生成格式
+    # 随机采样的 expression 本身不含计算信息，对它算 loss 等于拟合噪声，不应纳入。
+    buf = GPUDataBuffer(data_path, context_len, mode='sft', device=device)
 
     # ── Eval 数据 ────────────────────────────────────────────────────────────
     eval_data_path = log_cfg.get('eval_data_path', '')
@@ -276,7 +284,8 @@ def main(config_path: str):
                     break
         print(f"⚠ eval 文件不存在，从训练集借用 {len(eval_records)} 条")
 
-    eval_batch = make_eval_batch(eval_records, context_len, eval_bs, device)
+    # val_loss 的 loss mask 与训练保持一致（都只对 target 算）
+    eval_batch = make_eval_batch(eval_records, context_len, eval_bs, device, mode='sft')
     # eval_batch: (inp [B, C-1], lbl [B, C-1])，固定不变
 
     # ── 优化器 ──────────────────────────────────────────────────────────────

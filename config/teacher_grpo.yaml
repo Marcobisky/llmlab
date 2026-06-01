@@ -48,5 +48,3 @@ logging:
   ckpt_dtype: float16
   tmp_ckpt_dir: tmp/teacher_grpo/
   grid_res: 31
-  landscape_alpha_range: [-1.0, 1.0]
-  landscape_beta_range: [-1.0, 1.0]

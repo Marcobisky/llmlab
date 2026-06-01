@@ -125,7 +125,7 @@ def plot_all_landscapes(landscapes: Dict, out_dir: Path):
     for j in range(i + 1, len(axes)):
         axes[j].set_visible(False)
 
-    fig.suptitle('Loss Landscape（PCA 方向，训练轨迹投影）', fontsize=13)
+    fig.suptitle('Loss Landscape (PCA Directions, Training Trajectory Projection)', fontsize=13)
     fig.tight_layout()
 
     out = out_dir / 'landscape_all.png'
