@@ -1,12 +1,12 @@
 data:
   path: data/teacher_sft.jsonl
   split: teacher_train
-  depth_range: [0, 3]
+  depth_range: [0, 5]
   seed: 42
 
 model:
   vocab_size: 34
-  context_len: 48
+  context_len: 96
   d_model: 192
   n_layers: 6
   n_heads: 6

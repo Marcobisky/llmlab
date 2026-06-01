@@ -1,27 +1,27 @@
 data:
   path: data/student_pretrain.jsonl
   split: student_train
-  n_samples: 50000
+  n_samples: 500000
   depth_range: [0, 5]
-  operand_len_range: [1, 6]
+  operand_len_range: [2, 8]
   n_operands_range: [1, 3]
   ops_enabled: all
   check_fraction: 0.15
   verdict_ratio: [5, 3, 2]
-  cot_fraction: 0.0               # student pretrain 默认不加 CoT
+  cot_fraction: 0.0               # student pretrain 不加 CoT（student 容量小，优先学会直接生成）
   vw_corruption: swap
   noise_rate: 0.0
   seed: 44
 
 model:
   vocab_size: 34
-  context_len: 48
+  context_len: 96
   d_model: 64
   n_layers: 3
   n_heads: 4
   d_head: 16
   d_ffn: 256
-  dropout: 0.0
+  dropout: 0.1
   tie_embedding: true
   pos_embedding: learned
   norm_type: pre_ln
@@ -30,9 +30,9 @@ model:
 train:
   lr: 1.0e-3
   lr_schedule: cosine
-  batch_size: 1024                # student 0.15M 参数，batch 1024 显存开销很小
-  n_steps: 8000                  # 50k / 1024 ≈ 49 steps/epoch → 约 163 epoch
-  warmup_steps: 400
+  batch_size: 1024
+  n_steps: 50000                  # 500k/1024 ≈ 488 steps/epoch → ≈102 epoch
+  warmup_steps: 2000
   weight_decay: 0.1
   grad_clip: 2.0
   amp: true
@@ -46,7 +46,7 @@ output:
   log_dir: log/student_pretrain/
 
 logging:
-  log_every: 200
+  log_every: 1000
   eval_batch_size: 256
   eval_data_path: data/eval.jsonl
   n_traj_ckpt: 30

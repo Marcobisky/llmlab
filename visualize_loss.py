@@ -205,7 +205,7 @@ def plot_acc_by_depth(data: Dict, out_dir: Path):
 
     ax.set_xlabel('Depth')
     ax.set_ylabel('Accuracy')
-    ax.set_title('Task Accuracy by Depth（最终 checkpoint）')
+    ax.set_title('Task Accuracy by Depth (Final checkpoint)')
     ax.set_xticks(x)
     ax.set_xticklabels([f'd={d}' for d in depths])
     ax.set_ylim(0, 1.05)

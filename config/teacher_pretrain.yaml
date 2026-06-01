@@ -1,43 +1,43 @@
 data:
   path: data/teacher_pretrain.jsonl
   split: teacher_train
-  n_samples: 50000
-  depth_range: [0, 3]
-  operand_len_range: [1, 6]
+  n_samples: 500000               # 500k 样本；depth 0-5 × operand [2,8] 空间巨大，几乎无重复
+  depth_range: [0, 5]             # teacher 训练全深度，成为强 teacher 供蒸馏
+  operand_len_range: [2, 8]       # 最短 2 位（避免平凡单字符），最长 8 位
   n_operands_range: [1, 3]
   ops_enabled: all
   check_fraction: 0.15
   verdict_ratio: [5, 3, 2]        # vc : vw : gw
-  cot_fraction: 0.1               # 从 0.2 降到 0.1：CoT 轨迹长、loss 大，过多会压制直接任务学习
-  vw_corruption: swap             # swap | replace | truncate | shuffle
+  cot_fraction: 0.1               # CoT trace 在 ctx=96 下 88% 可通过过滤
+  vw_corruption: swap
   noise_rate: 0.0
   seed: 42
 
 model:
-  vocab_size: 34                  # 32 + <think> + </think>
-  context_len: 48
+  vocab_size: 34                  # 32 base + <think> + </think>
+  context_len: 96                 # 48→96：depth-5 + operand-8 的 CoT trace 在 ctx=96 通过率 88%
   d_model: 192
   n_layers: 6
   n_heads: 6
   d_head: 32
   d_ffn: 768
-  dropout: 0.1                    # 0.0→0.1：val-train gap 从 0.09 升到 0.70，过拟合明显
+  dropout: 0.1
   tie_embedding: true
-  pos_embedding: learned          # learned | sinusoidal
+  pos_embedding: learned
   norm_type: pre_ln
   activation: gelu
 
 train:
   lr: 1.0e-3
-  lr_schedule: cosine             # cosine | constant；LR 衰减到 lr*0.1（不砸 0）
-  batch_size: 1024                # A5000 24GB，teacher 2.67M 参数可轻松跑 1024
-  n_steps: 20000                 # 8000→20000：acc 在 8000 步时仍在上升（d3=47%），需要更多训练
-  warmup_steps: 800              # 步数翻倍，warmup 同比延长
+  lr_schedule: cosine             # 衰减到 lr×0.1，不砸 0
+  batch_size: 1024
+  n_steps: 50000                  # 500k/1024 ≈ 488 steps/epoch → 50k步 ≈ 102 epoch
+  warmup_steps: 2000
   weight_decay: 0.1
-  grad_clip: 2.0                  # 原 1.0 裁剪太激进（gnorm 常 5-30）
+  grad_clip: 2.0
   amp: true
-  amp_dtype: bf16                 # bf16：Ampere+ 原生支持，范围同 FP32，无需 GradScaler
-  compile: true                   # torch.compile(mode="reduce-overhead")
+  amp_dtype: bf16
+  compile: true
   seed: 42
   device: cuda
 
@@ -46,7 +46,7 @@ output:
   log_dir: log/teacher_pretrain/
 
 logging:
-  log_every: 400                  # n_steps 翻倍，eval 频率同比降低，保持 50 个 log 点
+  log_every: 1000                 # 50k步 / 50 log 点
   eval_batch_size: 256
   eval_data_path: data/eval.jsonl
   n_traj_ckpt: 30

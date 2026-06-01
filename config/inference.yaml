@@ -1,7 +1,7 @@
 model_path: model/student_grpo.pt   # 要加载的权重
 model:
   vocab_size: 34
-  context_len: 48
+  context_len: 96
   d_model: 64
   n_layers: 3
   n_heads: 4
