@@ -141,7 +141,10 @@ def compute_task_acc(
         done = torch.zeros(B, dtype=torch.bool, device=device)
         gen  = [[] for _ in range(B)]       # gen[b] = 已生成 token id 列表
 
-        for _ in range(32):                 # max_new
+        # CoT 输出可达 60-70 token（depth-5，8 位 operand），需留足生成预算。
+        # 旧值 32 在 context_len=48 时够用，context_len 改 96 后需同步更新。
+        max_new = context_len - prompt_len  # 最多用完剩余上下文窗口
+        for _ in range(max_new):
             if done.all() or ids.shape[1] >= context_len:
                 break
             logits = model(ids)             # [B, T, V]
