@@ -1,8 +1,12 @@
+# Training config: student model GRPO alignment.
+# Requires: log/student_sft/student_sft.pt
+# Usage: python grpo.py --config config/student_grpo.yaml
+#
+# Config name = log subdirectory name (log/student_grpo/).
+# To start a new training run, create a NEW config file — do not reuse this one.
+
 data:
   path: data/student_sft.jsonl
-  split: student_train
-  depth_range: [0, 5]
-  seed: 42
 
 model:
   vocab_size: 34
@@ -19,8 +23,8 @@ model:
   activation: gelu
 
 train:
-  base_model_path: model/student_sft.pt
-  reference_model_path: model/student_sft.pt   # KL 惩罚的参考点
+  base_model_path: log/student_sft/student_sft.pt
+  reference_model_path: log/student_sft/student_sft.pt
   lr: 5.0e-5
   lr_schedule: cosine
   batch_size: 32
@@ -31,15 +35,15 @@ train:
   n_rollouts_per_prompt: 8
   clip_eps: 0.2
   kl_coeff: 0.05
-  reward_fn: interpreter          # interpreter | partial_match
+  reward_fn: interpreter
   rollout_temperature: 1.0
   loss_on_prompt: false
   seed: 42
   device: cuda
 
 output:
-  model_path: model/student_grpo.pt
-  log_dir: log/student_grpo/
+  model_path: log/student_grpo/student_grpo.pt
+  log_dir: log/student_grpo
 
 logging:
   log_every: 20
@@ -47,5 +51,14 @@ logging:
   eval_data_path: data/eval.jsonl
   n_traj_ckpt: 30
   ckpt_dtype: float16
-  tmp_ckpt_dir: tmp/student_grpo/
+  tmp_ckpt_dir: log/student_grpo/checkpoint
   grid_res: 31
+  pca_basis_path: log/student_pretrain/pca_basis.npz  # reuse pretrain PCA axes for comparable landscapes
+
+inference:
+  temperature: 0.0
+  top_p: 1.0
+  max_new_tokens: 96
+  show_cot: false
+  show_raw: false
+  device: cuda

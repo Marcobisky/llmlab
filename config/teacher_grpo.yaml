@@ -1,8 +1,12 @@
+# Training config: teacher model GRPO alignment.
+# Requires: log/teacher_sft/teacher_sft.pt
+# Usage: python grpo.py --config config/teacher_grpo.yaml
+#
+# Config name = log subdirectory name (log/teacher_grpo/).
+# To start a new training run, create a NEW config file — do not reuse this one.
+
 data:
-  path: data/teacher_sft.jsonl    # 只用 prompt 字段
-  split: teacher_train
-  depth_range: [0, 5]
-  seed: 42
+  path: data/teacher_sft.jsonl    # only the prompt field is used for rollouts
 
 model:
   vocab_size: 34
@@ -19,7 +23,8 @@ model:
   activation: gelu
 
 train:
-  base_model_path: model/teacher_sft.pt
+  base_model_path: log/teacher_sft/teacher_sft.pt
+  reference_model_path: log/teacher_sft/teacher_sft.pt   # KL penalty reference
   lr: 5.0e-5
   lr_schedule: cosine
   batch_size: 32                  # prompts per step
@@ -27,9 +32,9 @@ train:
   warmup_steps: 50
   weight_decay: 0.0
   grad_clip: 1.0
-  n_rollouts_per_prompt: 8        # G：每个 prompt 采样几条
-  clip_eps: 0.2                   # importance sampling clip ε
-  kl_coeff: 0.05                  # β：KL 惩罚系数
+  n_rollouts_per_prompt: 8        # G: rollouts per prompt
+  clip_eps: 0.2                   # importance sampling clip epsilon
+  kl_coeff: 0.05                  # beta: KL penalty coefficient
   reward_fn: interpreter          # interpreter | partial_match
   rollout_temperature: 1.0
   loss_on_prompt: false
@@ -37,8 +42,8 @@ train:
   device: cuda
 
 output:
-  model_path: model/teacher_grpo.pt
-  log_dir: log/teacher_grpo/
+  model_path: log/teacher_grpo/teacher_grpo.pt
+  log_dir: log/teacher_grpo
 
 logging:
   log_every: 20
@@ -46,5 +51,14 @@ logging:
   eval_data_path: data/eval.jsonl
   n_traj_ckpt: 30
   ckpt_dtype: float16
-  tmp_ckpt_dir: tmp/teacher_grpo/
+  tmp_ckpt_dir: log/teacher_grpo/checkpoint
   grid_res: 31
+  pca_basis_path: log/teacher_pretrain/pca_basis.npz  # reuse pretrain PCA axes for comparable landscapes
+
+inference:
+  temperature: 0.0
+  top_p: 1.0
+  max_new_tokens: 96
+  show_cot: true
+  show_raw: false
+  device: cuda

@@ -1,8 +1,12 @@
+# Training config: teacher model SDPO alignment.
+# Requires: log/teacher_sft/teacher_sft.pt
+# Usage: python sdpo.py --config config/teacher_sdpo.yaml
+#
+# Config name = log subdirectory name (log/teacher_sdpo/).
+# To start a new training run, create a NEW config file — do not reuse this one.
+
 data:
   path: data/teacher_sft.jsonl
-  split: teacher_train
-  depth_range: [0, 5]
-  seed: 42
 
 model:
   vocab_size: 34
@@ -19,7 +23,7 @@ model:
   activation: gelu
 
 train:
-  base_model_path: model/teacher_sft.pt
+  base_model_path: log/teacher_sft/teacher_sft.pt
   lr: 5.0e-5
   lr_schedule: cosine
   batch_size: 32
@@ -27,7 +31,7 @@ train:
   warmup_steps: 50
   weight_decay: 0.0
   grad_clip: 1.0
-  feedback_type: ground_truth     # 把 GT 结果拼入 prompt 作为 feedback
+  feedback_type: ground_truth     # append GT result to prompt as feedback
   sdpo_temperature: 1.0
   kl_coeff: 0.05
   loss_on_prompt: false
@@ -35,8 +39,8 @@ train:
   device: cuda
 
 output:
-  model_path: model/teacher_sdpo.pt
-  log_dir: log/teacher_sdpo/
+  model_path: log/teacher_sdpo/teacher_sdpo.pt
+  log_dir: log/teacher_sdpo
 
 logging:
   log_every: 20
@@ -44,5 +48,14 @@ logging:
   eval_data_path: data/eval.jsonl
   n_traj_ckpt: 30
   ckpt_dtype: float16
-  tmp_ckpt_dir: tmp/teacher_sdpo/
+  tmp_ckpt_dir: log/teacher_sdpo/checkpoint
   grid_res: 31
+  pca_basis_path: log/teacher_pretrain/pca_basis.npz  # reuse pretrain PCA axes for comparable landscapes
+
+inference:
+  temperature: 0.0
+  top_p: 1.0
+  max_new_tokens: 96
+  show_cot: true
+  show_raw: false
+  device: cuda

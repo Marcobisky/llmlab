@@ -1,0 +1,20 @@
+# Data generation config: 100k stmt-only samples, depth 0-5, student split.
+# Usage: python data.py --config config/stmt_100k_depth5.yaml
+# Output: data/student_sft.jsonl
+
+data:
+  path: data/student_sft.jsonl
+  split: student_train
+  n_samples: 100000
+  depth_range: [0, 5]
+  operand_len_range: [1, 6]
+  n_operands_range: [1, 3]
+  ops_enabled: all
+  check_fraction: 0.0
+  verdict_ratio: [5, 3, 2]
+  cot_fraction: 0.0
+  vw_corruption: swap
+  noise_rate: 0.0
+  seed: 45
+
+context_len: 96

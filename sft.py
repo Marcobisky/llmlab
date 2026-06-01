@@ -1,52 +1,49 @@
 """
-sft.py — Teacher / Student 有监督微调（SFT）。
+sft.py — Supervised fine-tuning (SFT) for teacher and student models.
 
-从 pretrain checkpoint 出发，在 CoT 数据集上精调，强化思维链生成能力。
-训练逻辑完全复用 pretrain.py，SFT 的本质差异体现在配置文件中：
+Starts from a pretrain checkpoint and fine-tunes on CoT (or stmt) data,
+reinforcing chain-of-thought generation ability.
 
-  data.cot_fraction   = 1.0   只用 CoT 样本（<think> TRACE </think> 格式）
-  train.base_model_path       从 pretrain 权重热启动（而非随机初始化）
-  train.lr            = 1e-4  比 pretrain (1e-3) 小 10×，保留已有知识
-  model.dropout       = 0.0   精调阶段关闭 dropout
+Key differences from pretraining (expressed in the config file):
+    data.path             CoT dataset (teacher_sft.jsonl or student_sft.jsonl)
+    train.base_model_path warm-start from pretrain checkpoint
+    train.lr              10x smaller than pretrain to preserve learned knowledge
+    model.dropout         0.0 during fine-tuning
 
-数据加载用 mode='sft'：prompt（[BOS] EXPR）的 label 置 -100，
-只对 target（<think>...RESULT [EOS]）计算 cross-entropy loss，
-即只对思维链轨迹和最终答案优化，不拟合随机输入表达式。
+Training logic is fully reused from pretrain.py.
 
-流程：
-    1. python data.py config/teacher_sft.yaml      生成 CoT 训练集
-    2. python sft.py [config/teacher_sft.yaml]     启动 SFT
-
-输出：
-    model/teacher_sft.pt
-    log/teacher_sft/metrics.jsonl
+Usage:
+    python sft.py --config config/teacher_sft.yaml
+    python sft.py --config config/student_sft.yaml
 """
+import argparse
 import os
 import sys
 from pathlib import Path
 
-CONFIG_YAML = "config/teacher_sft.yaml"
-
 
 def main(config_path: str):
-    # 快速校验 base model 存在，避免跑完数据加载才报错
     import yaml
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
+    # sanity check: base model must exist before loading data
     base = cfg.get('train', {}).get('base_model_path', '')
     if base and not Path(base).exists():
-        print(f"✗ base_model_path 不存在: {base}")
-        print("  请先运行 pretrain.py 生成 teacher pretrain checkpoint。")
+        print(f"Error: base_model_path not found: {base}")
+        print("  Run pretrain.py first to produce the base checkpoint.")
         sys.exit(1)
 
-    # 训练逻辑完全复用 pretrain.main()
+    # reuse pretrain.main() — all behaviour is config-driven
     from pretrain import main as pretrain_main
     pretrain_main(config_path)
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Supervised fine-tuning')
+    parser.add_argument('--config', required=True,
+                        help='Path to training config yaml (e.g. config/teacher_sft.yaml)')
+    args = parser.parse_args()
     os.chdir(Path(__file__).parent)
     sys.path.insert(0, str(Path(__file__).parent))
-    config_path = sys.argv[1] if len(sys.argv) > 1 else CONFIG_YAML
-    main(config_path)
+    main(args.config)

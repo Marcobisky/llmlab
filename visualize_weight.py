@@ -1,13 +1,16 @@
 """
-visualize_weight.py — 只读 log/*/landscape.npz，生成 loss landscape 等高线 + 轨迹图。
+visualize_weight.py — Reads log/*/landscape.npz and generates loss landscape plots.
 
-每个 stage 一张子图：等高线 = loss landscape，散点+折线 = 训练轨迹，
-★ = 训练终点（theta*）对应坐标原点（0,0）。
+Each stage gets one subplot: contour = loss landscape, scatter+line = training trajectory,
+star (*) = theta* (training endpoint, coordinate origin (0,0)).
 
-用法：
-    python visualize_weight.py
-    python visualize_weight.py --log log/ --out figures/
+All plots are saved to log/<config_name>/fig/ (derived from the --config argument).
+
+Usage:
+    python visualize_weight.py --config config/teacher_pretrain.yaml
 """
+import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Dict
@@ -16,8 +19,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+import yaml
 
-# stage 顺序（与 visualize_loss.py 保持一致）
 STAGE_ORDER = [
     'teacher_pretrain', 'teacher_sft', 'teacher_grpo', 'teacher_sdpo',
     'student_pretrain', 'student_sft',
@@ -25,12 +28,8 @@ STAGE_ORDER = [
 ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 加载
-# ─────────────────────────────────────────────────────────────────────────────
-
 def load_all_landscapes(log_root: str = 'log') -> Dict[str, dict]:
-    """扫描 log/*/landscape.npz，返回 {stage: {alpha_grid, beta_grid, Z, traj_alpha, traj_beta}}。"""
+    """Scan log/*/landscape.npz. Returns {stage: {alpha_grid, beta_grid, Z, traj_*}}."""
     result = {}
     for stage_dir in sorted(Path(log_root).iterdir()):
         if not stage_dir.is_dir():
@@ -43,19 +42,13 @@ def load_all_landscapes(log_root: str = 'log') -> Dict[str, dict]:
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 单 stage 绘图
-# ─────────────────────────────────────────────────────────────────────────────
-
 def plot_one_landscape(ax, ld: dict, stage: str):
     """
-    在给定 Axes 上绘制 loss landscape + 轨迹。
+    Draw loss landscape + trajectory on the given Axes.
 
-    坐标系：(0,0) = theta*（训练终点）；等高线范围自动扩展覆盖完整轨迹。
-
-    兼容两种 npz：
-      - 新版（save_landscape 自动定范围）：网格已覆盖轨迹
-      - 旧版（固定 ±1 范围）：轴范围扩展到轨迹，等高线只绘制网格区域内
+    Coordinate system: (0,0) = theta* (training endpoint).
+    Grid range is auto-derived from the actual trajectory (new-style npz) or
+    fixed +-1 (old-style npz); trajectory points are always visible.
     """
     ag = ld['alpha_grid']   # [grid_res]
     bg = ld['beta_grid']    # [grid_res]
@@ -63,23 +56,22 @@ def plot_one_landscape(ax, ld: dict, stage: str):
     ta = ld['traj_alpha']   # [N]
     tb = ld['traj_beta']    # [N]
 
-    # ── 等高线（对数压缩让低谷更清晰）──────────────────────────────────────
+    # log-compress to make the loss valley more visible
     Z_plot = np.log1p(Z - Z.min())
     levels = np.linspace(Z_plot.min(), Z_plot.max(), 20)
 
     B, A = np.meshgrid(bg, ag)
     cf = ax.contourf(B, A, Z_plot, levels=levels, cmap='RdYlGn_r', alpha=0.85)
     ax.contour(B, A, Z_plot, levels=levels[::4], colors='k', linewidths=0.4, alpha=0.5)
-    plt.colorbar(cf, ax=ax, label='log(1+L−Lmin)', shrink=0.82, pad=0.02)
+    plt.colorbar(cf, ax=ax, label='log(1+L-Lmin)', shrink=0.82, pad=0.02)
 
-    # ── 轨迹 ────────────────────────────────────────────────────────────────
     if len(ta) > 0:
         ax.plot(tb, ta, 'o-', color='royalblue', markersize=3,
                 linewidth=1.0, label='Trajectory', zorder=3)
         ax.scatter(tb[0], ta[0], color='cyan',  s=50, zorder=4, label='Start')
-    ax.scatter([0], [0], color='red', s=80, marker='*', zorder=5, label='θ* (end)')
+    ax.scatter([0], [0], color='red', s=80, marker='*', zorder=5, label='theta* (end)')
 
-    # ── 自动轴范围：覆盖网格 + 轨迹，加 5% 边距 ───────────────────────────
+    # auto axis limits covering both grid and trajectory
     all_b = np.concatenate([bg, tb]) if len(tb) else bg
     all_a = np.concatenate([ag, ta]) if len(ta) else ag
     def _lim(vals, margin=0.05):
@@ -89,87 +81,89 @@ def plot_one_landscape(ax, ld: dict, stage: str):
     ax.set_xlim(_lim(all_b))
     ax.set_ylim(_lim(all_a))
 
-    # 用虚线框标出实际网格边界（若轨迹超出网格才有意义）
+    # dashed box marks grid boundary when trajectory extends beyond grid
     rect_b = [bg.min(), bg.max(), bg.max(), bg.min(), bg.min()]
     rect_a = [ag.min(), ag.min(), ag.max(), ag.max(), ag.min()]
     ax.plot(rect_b, rect_a, 'k--', linewidth=0.7, alpha=0.4, label='Grid boundary')
 
-    ax.set_xlabel('β (PC2)')
-    ax.set_ylabel('α (PC1)')
+    ax.set_xlabel('beta (PC2)')
+    ax.set_ylabel('alpha (PC1)')
     ax.set_title(stage)
     ax.legend(fontsize=6, loc='best')
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 全局绘图
-# ─────────────────────────────────────────────────────────────────────────────
+def _shared_basis_note(landscapes: Dict, log_root: str = 'log') -> str:
+    """
+    Build a note for the plot title indicating which stages share a PCA basis.
+    A stage 'foo' is a base stage if log/foo/pca_basis.npz exists and was produced
+    by that stage's own SVD (i.e. it didn't load from somewhere else).
+    We detect this by checking for pca_basis.npz in each stage's log dir.
+    """
+    base_stages = [s for s in landscapes
+                   if (Path(log_root) / s / 'pca_basis.npz').exists()]
+    if not base_stages:
+        return ''
+    return f'  |  Shared PCA basis anchored at: {", ".join(base_stages)}'
 
-def plot_all_landscapes(landscapes: Dict, out_dir: Path):
+
+def plot_all_landscapes(landscapes: Dict, out_dir: Path, log_root: str = 'log'):
     stages = [s for s in STAGE_ORDER if s in landscapes]
     stages += [s for s in landscapes if s not in STAGE_ORDER]
     if not stages:
-        print("无 landscape 数据，退出。")
+        print("No landscape data, exiting.")
         return
 
     n  = len(stages)
-    nc = min(3, n)          # 每行最多 3 列
+    nc = min(3, n)
     nr = (n + nc - 1) // nc
 
     fig, axes = plt.subplots(nr, nc, figsize=(6 * nc, 5 * nr))
-    axes = np.array(axes).reshape(-1)  # 展平，方便索引
+    axes = np.array(axes).reshape(-1)
 
     for i, stage in enumerate(stages):
         plot_one_landscape(axes[i], landscapes[stage], stage)
 
-    # 隐藏多余子图
     for j in range(i + 1, len(axes)):
         axes[j].set_visible(False)
 
-    fig.suptitle('Loss Landscape (PCA Directions, Training Trajectory Projection)', fontsize=13)
+    basis_note = _shared_basis_note(landscapes, log_root)
+    fig.suptitle(
+        f'Loss Landscape (PCA Directions, Training Trajectory Projection){basis_note}',
+        fontsize=11
+    )
     fig.tight_layout()
 
     out = out_dir / 'landscape_all.png'
     fig.savefig(out, dpi=150)
     plt.close(fig)
-    print(f"  landscape 图已保存: {out}")
+    print(f"  Landscape plot saved: {out}")
 
-    # 同时单独保存每个 stage
-    for stage in stages:
-        fig2, ax2 = plt.subplots(figsize=(6, 5))
-        plot_one_landscape(ax2, landscapes[stage], stage)
-        fig2.tight_layout()
-        single_out = out_dir / f'landscape_{stage}.png'
-        fig2.savefig(single_out, dpi=150)
-        plt.close(fig2)
-        print(f"  landscape 图已保存: {single_out}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 入口
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--log', default='log',  help='log 根目录')
-    parser.add_argument('--out', default='',     help='输出目录（默认 log/figures/）')
+    parser = argparse.ArgumentParser(description='Loss landscape visualizer')
+    parser.add_argument('--config', required=True,
+                        help='Training config yaml; determines output fig dir (log/<name>/fig/)')
     args = parser.parse_args()
 
-    out_dir = Path(args.out) if args.out else Path(args.log) / 'figures'
+    os.chdir(Path(__file__).parent)
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    log_dir = cfg['output']['log_dir']
+    out_dir = Path(log_dir) / 'fig'
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"扫描 {args.log}/*/landscape.npz ...")
-    landscapes = load_all_landscapes(args.log)
+    print(f"Scanning log/*/landscape.npz ...")
+    landscapes = load_all_landscapes('log')
     if not landscapes:
-        print("未找到 landscape.npz，请先完成训练。")
+        print("No landscape.npz files found. Run training first.")
         return
 
-    print(f"找到 {len(landscapes)} 个 stage 的 landscape。\n")
-    plot_all_landscapes(landscapes, out_dir)
-    print(f"\n所有图已保存到 {out_dir}")
+    print(f"Found {len(landscapes)} stage landscape(s).\n")
+    plot_all_landscapes(landscapes, out_dir, log_root='log')
+    print(f"\nAll plots saved to {out_dir}")
 
 
 if __name__ == '__main__':
-    import os
-    os.chdir(Path(__file__).parent)
     main()

@@ -1,20 +1,21 @@
 """
-data.py — 数据集生成器。
-读入 config/ 中指定的 yaml，生成满足配置的 data/*.jsonl。
+data.py — Dataset generator.
+Reads a data config yaml and writes the corresponding data/*.jsonl file.
 
-用法：
-  python data.py                          # 使用文件顶部 CONFIG_YAML 指定的配置
-  python data.py config/eval.yaml         # 命令行指定（可覆盖顶部变量）
+Usage:
+    python data.py --config config/expr_500k_depth5.yaml
+    python data.py --config config/eval_10k_depth5.yaml
 
-字段规范（§2.5）：
-  prompt  : str  — 模型输入前缀（含 [BOS]，空格分隔 token）
-  target  : str  — 需要预测的 token 串（空格分隔）
-  expr    : str  — 原始表达式字符串
-  result  : str  — 解释器计算的正确结果
-  depth   : int  — 组合深度 = n_unary + (n_operands - 1)
-  type    : str  — 'stmt' | 'check' | 'cot'
-  split   : str  — 'teacher_train' | 'student_train' | 'eval'
+Record schema:
+    prompt  : str  — model input prefix (includes [BOS], space-separated tokens)
+    target  : str  — tokens to predict (space-separated)
+    expr    : str  — raw expression string
+    result  : str  — interpreter-computed correct result
+    depth   : int  — composition depth = n_unary + (n_operands - 1)
+    type    : str  — 'stmt' | 'check' | 'cot'
+    split   : str  — 'teacher_train' | 'student_train' | 'eval'
 """
+import argparse
 import json
 import os
 import random
@@ -24,11 +25,6 @@ from typing import Dict, List, Optional, Set
 
 import yaml
 
-# ── 用户配置：修改此处选择要生成的数据集 ─────────────────────────────────────
-CONFIG_YAML = "config/teacher_pretrain.yaml"
-# ─────────────────────────────────────────────────────────────────────────────
-
-# 把 src/ 加入路径，使 lib.lang 可 import
 sys.path.insert(0, str(Path(__file__).parent))
 from lib.lang import (
     ALL_UNARY, ALL_BINARY,
@@ -40,19 +36,19 @@ from lib.lang import (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Token 串构建（写入 jsonl 的 prompt / target 字段）
+# Token string builders (written to jsonl prompt / target fields)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _expr_str(expr: str) -> str:
-    """紧凑表达式 → 空格分隔 token 串。'ir23c0' → 'i r 2 3 c 0'"""
+    """Compact expression -> space-separated token string. 'ir23c0' -> 'i r 2 3 c 0'"""
     return tokens_to_str(expr_to_tokens(expr))
 
 
 def _build_stmt(expr: str, result: str, split: str) -> Dict:
     """
-    陈述句（stmt）。
-      pretrain: prompt = '[BOS] EXPR'，target = '= RESULT [EOS]'
-      full_text = '[BOS] EXPR = RESULT [EOS]'
+    Statement (stmt).
+        prompt = '[BOS] EXPR'
+        target = '= RESULT [EOS]'
     """
     expr_t   = _expr_str(expr)
     result_t = _expr_str(result)
@@ -65,9 +61,9 @@ def _build_stmt(expr: str, result: str, split: str) -> Dict:
 def _build_check(expr: str, candidate: str, verdict: str,
                  result: Optional[str], split: str) -> Dict:
     """
-    检查句（check）。
-      prompt = '[BOS] EXPR = CANDIDATE ?'
-      target = 'VERDICT [EOS]'
+    Check sentence.
+        prompt = '[BOS] EXPR = CANDIDATE ?'
+        target = 'VERDICT [EOS]'
     """
     expr_t      = _expr_str(expr)
     candidate_t = _expr_str(candidate) if candidate.isdigit() or candidate == '' else candidate
@@ -79,18 +75,16 @@ def _build_check(expr: str, candidate: str, verdict: str,
 
 def _build_cot(expr: str, trace: str, result: str, split: str) -> Dict:
     """
-    CoT 句（cot）。
-      prompt = '[BOS] EXPR'
-      target = '<think> TRACE </think> = RESULT [EOS]'
-    TRACE 内部 '=' 已在 build_cot_trace 中生成，这里逐步 token 化。
+    CoT sentence.
+        prompt = '[BOS] EXPR'
+        target = '<think> TRACE </think> = RESULT [EOS]'
 
-    trace 格式（紧凑）: 'ir23c0=ir230=i032=032'
-    目标格式: '<think> i r 2 3 c 0 = i r 2 3 0 = i 0 3 2 = 0 3 2 </think> = 0 3 2 [EOS]'
+    trace format (compact): 'ir23c0=ir230=i032=032'
+    target format: '<think> i r 2 3 c 0 = i r 2 3 0 = i 0 3 2 = 0 3 2 </think> = 0 3 2 [EOS]'
     """
     expr_t   = _expr_str(expr)
     result_t = _expr_str(result)
 
-    # 将 trace 中每个步骤 token 化，用 ' = ' 连接
     steps = trace.split('=')
     trace_t = ' = '.join(_expr_str(s) for s in steps)
 
@@ -101,7 +95,7 @@ def _build_cot(expr: str, trace: str, result: str, split: str) -> Dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 单样本生成
+# Single sample generation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sample_depth_and_operands(
@@ -110,15 +104,14 @@ def _sample_depth_and_operands(
     rng: random.Random,
 ) -> tuple:
     """
-    采样 (total_depth, n_operands, n_unary)，满足：
-      n_unary = total_depth - (n_operands - 1) >= 0
+    Sample (total_depth, n_operands, n_unary) satisfying:
+        n_unary = total_depth - (n_operands - 1) >= 0
     """
     d_min, d_max = depth_range
     no_min, no_max = n_operands_range
 
     total_depth = rng.randint(d_min, d_max)
 
-    # 保证 n_operands - 1 <= total_depth
     op_max = min(no_max, total_depth + 1)
     op_min = max(no_min, 1)
     if op_min > op_max:
@@ -130,7 +123,7 @@ def _sample_depth_and_operands(
 
 
 def _token_len(rec: Dict) -> int:
-    """计算 prompt + target 合并后的 token 数（空格分隔）。"""
+    """Total token count of prompt + target combined (space-separated)."""
     return len((rec['prompt'] + ' ' + rec['target']).split())
 
 
@@ -140,12 +133,12 @@ def _generate_one(
     used_exprs: Set[str],
     split: str,
     sentence_type: str,   # 'stmt' | 'cot' | 'check_vc' | 'check_vw' | 'check_gw'
-    context_len: int = 512,   # 超过此长度的样本被丢弃
+    context_len: int = 512,
     max_tries: int = 200,
 ) -> Optional[Dict]:
     """
-    生成一条样本记录，保证 expr 不在 used_exprs 中（去重）。
-    失败时返回 None。
+    Generate one sample record, ensuring expr is not in used_exprs (deduplication).
+    Returns None if max_tries is exceeded.
     """
     depth_range       = cfg['depth_range']
     n_operands_range  = cfg['n_operands_range']
@@ -155,20 +148,16 @@ def _generate_one(
 
     for _ in range(max_tries):
         if sentence_type == 'check_gw':
-            # 非法表达式长度很短，不需要长度过滤
-            # 非法表达式：纯算子，无操作数
             expr = make_invalid_expr(ops_enabled, rng)
             if expr in used_exprs:
                 continue
-            # 候选：随机数字串
             cand_len = rng.randint(1, 4)
             candidate = ''.join(str(rng.randint(0, 9)) for _ in range(cand_len))
             used_exprs.add(expr)
             rec = _build_check(expr, candidate, 'gw', result=None, split=split)
-            rec['depth'] = 0   # gw 无意义，填 0
+            rec['depth'] = 0
             return rec
 
-        # 合法表达式
         total_depth, n_operands, n_unary = _sample_depth_and_operands(
             depth_range, n_operands_range, rng)
         expr = sample_expr(n_unary, n_operands, tuple(operand_len_range),
@@ -178,7 +167,7 @@ def _generate_one(
 
         result, is_valid = interpret(expr)
         if not is_valid:
-            continue  # 极少数边界情况（如空串操作数）跳过
+            continue
 
         used_exprs.add(expr)
 
@@ -196,7 +185,7 @@ def _generate_one(
             rec = _build_cot(expr, trace, result, split)
             rec['depth'] = total_depth
             if _token_len(rec) > context_len:
-                continue  # CoT 轨迹过长，重新采样
+                continue
             return rec
 
         if sentence_type == 'check_vc':
@@ -214,27 +203,27 @@ def _generate_one(
                 continue
             return rec
 
-    return None  # 超过重试次数，跳过
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 数据集生成主逻辑
+# Dataset generation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_type_schedule(n_samples: int, cfg: Dict, rng: random.Random) -> List[str]:
     """
-    根据 check_fraction / cot_fraction / verdict_ratio 生成每条样本的句型标签列表。
-    返回长度为 n_samples 的列表，元素为 'stmt'|'cot'|'check_vc'|'check_vw'|'check_gw'。
+    Build a shuffled list of sentence type labels based on check_fraction,
+    cot_fraction, and verdict_ratio.
+    Returns a list of length n_samples with elements in
+    {'stmt', 'cot', 'check_vc', 'check_vw', 'check_gw'}.
     """
     check_frac = cfg.get('check_fraction', 0.0)
     cot_frac   = cfg.get('cot_fraction',   0.0)
-    stmt_frac  = max(0.0, 1.0 - check_frac - cot_frac)
 
     n_check = int(n_samples * check_frac)
     n_cot   = int(n_samples * cot_frac)
     n_stmt  = n_samples - n_check - n_cot
 
-    # 按 verdict_ratio 分配 check 子类
     vr = cfg.get('verdict_ratio', [5, 3, 2])
     total_vr = sum(vr)
     n_vc = int(n_check * vr[0] / total_vr)
@@ -260,9 +249,9 @@ def generate_dataset(
     context_len: int = 512,
 ) -> List[Dict]:
     """
-    生成整个数据集，返回记录列表。
-    used_exprs 是全局已用 expr 集合（in-place 更新，确保跨数据集去重）。
-    context_len：超过此 token 数的样本被丢弃（防止超出模型上下文长度）。
+    Generate the full dataset, returning a list of records.
+    used_exprs is updated in-place to ensure cross-dataset deduplication.
+    Samples exceeding context_len tokens are discarded.
     """
     n_samples = cfg['n_samples']
     schedule  = _build_type_schedule(n_samples, cfg, rng)
@@ -277,18 +266,14 @@ def generate_dataset(
             continue
         records.append(rec)
         if (i + 1) % 5000 == 0:
-            print(f"  {i+1}/{n_samples} 已生成，跳过 {skipped} 条")
+            print(f"  {i+1}/{n_samples} generated, {skipped} skipped")
 
-    print(f"  完成：{len(records)} 条（跳过 {skipped} 条）")
+    print(f"  Done: {len(records)} records ({skipped} skipped)")
     return records
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 从已有 jsonl 加载 expr 集合（eval 去重用）
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _load_exprs_from_jsonl(path: str) -> Set[str]:
-    """从已存在的 .jsonl 文件中读取所有 expr 字段，返回集合。"""
+    """Load all 'expr' fields from an existing .jsonl file for deduplication."""
     exprs: Set[str] = set()
     p = Path(path)
     if not p.exists():
@@ -308,53 +293,50 @@ def _load_exprs_from_jsonl(path: str) -> Set[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 入口
+# Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # 命令行可覆盖 CONFIG_YAML
-    config_path = sys.argv[1] if len(sys.argv) > 1 else CONFIG_YAML
+    parser = argparse.ArgumentParser(description='Dataset generator')
+    parser.add_argument('--config', required=True,
+                        help='Path to data config yaml (e.g. config/expr_500k_depth5.yaml)')
+    args = parser.parse_args()
 
-    # 切换工作目录到 src/（使相对路径生效）
-    src_dir = Path(__file__).parent
-    os.chdir(src_dir)
+    os.chdir(Path(__file__).parent)
 
-    print(f"读取配置：{config_path}")
-    with open(config_path) as f:
+    print(f"Config: {args.config}")
+    with open(args.config) as f:
         full_cfg = yaml.safe_load(f)
 
-    data_cfg = full_cfg['data']
-    split    = data_cfg['split']
-    out_path = Path(data_cfg['path'])
-    seed     = data_cfg.get('seed', 42)
+    data_cfg    = full_cfg['data']
+    split       = data_cfg['split']
+    out_path    = Path(data_cfg['path'])
+    seed        = data_cfg.get('seed', 42)
+    context_len = full_cfg.get('context_len', 512)
 
     rng = random.Random(seed)
 
-    # 若有 exclude_from（eval 去重），先加载已有训练集 expr
     used_exprs: Set[str] = set()
     for excl in data_cfg.get('exclude_from', []):
         before = len(used_exprs)
         used_exprs |= _load_exprs_from_jsonl(excl)
-        print(f"  排除 {excl}：加入 {len(used_exprs)-before} 个 expr")
+        print(f"  Excluded {excl}: added {len(used_exprs)-before} exprs")
 
-    context_len = full_cfg.get('model', {}).get('context_len', 512)
-    print(f"生成 {data_cfg['n_samples']} 条 [{split}] → {out_path}  (context_len={context_len})")
+    print(f"Generating {data_cfg['n_samples']} [{split}] -> {out_path}  (context_len={context_len})")
     records = generate_dataset(data_cfg, split, used_exprs, rng, context_len=context_len)
 
-    # 写入 jsonl
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, 'w') as f:
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + '\n')
 
-    print(f"已写入 {out_path}（{len(records)} 条）")
+    print(f"Written to {out_path} ({len(records)} records)")
 
-    # 简单统计
     from collections import Counter
     type_counts  = Counter(r['type']  for r in records)
     depth_counts = Counter(r['depth'] for r in records)
-    print(f"  句型分布：{dict(type_counts)}")
-    print(f"  depth 分布：{dict(sorted(depth_counts.items()))}")
+    print(f"  Type distribution:  {dict(type_counts)}")
+    print(f"  Depth distribution: {dict(sorted(depth_counts.items()))}")
 
 
 if __name__ == '__main__':

@@ -1,21 +1,16 @@
+# Training config: teacher model pretraining.
+# Dataset must be generated first: python data.py --config config/expr_500k_depth5.yaml
+# Usage: python pretrain.py --config config/teacher_pretrain.yaml
+#
+# Config name = log subdirectory name (log/teacher_pretrain/).
+# To start a new training run, create a NEW config file — do not reuse this one.
+
 data:
-  path: data/teacher_pretrain.jsonl
-  split: teacher_train
-  n_samples: 500000               # 500k 样本；depth 0-5 × operand [2,8] 空间巨大，几乎无重复
-  depth_range: [0, 5]             # teacher 训练全深度，成为强 teacher 供蒸馏
-  operand_len_range: [2, 8]       # 最短 2 位（避免平凡单字符），最长 8 位
-  n_operands_range: [1, 3]
-  ops_enabled: all
-  check_fraction: 0.15
-  verdict_ratio: [5, 3, 2]        # vc : vw : gw
-  cot_fraction: 0.1               # CoT trace 在 ctx=96 下 88% 可通过过滤
-  vw_corruption: swap
-  noise_rate: 0.0
-  seed: 42
+  path: data/teacher_pretrain.jsonl   # path to pre-generated dataset
 
 model:
-  vocab_size: 34                  # 32 base + <think> + </think>
-  context_len: 96                 # 48→96：depth-5 + operand-8 的 CoT trace 在 ctx=96 通过率 88%
+  vocab_size: 34                  # 32 base tokens + <think> + </think>
+  context_len: 96                 # CoT traces for depth-5 + operand-8 pass at ~88%
   d_model: 192
   n_layers: 6
   n_heads: 6
@@ -29,27 +24,35 @@ model:
 
 train:
   lr: 1.0e-3
-  lr_schedule: cosine             # 衰减到 lr×0.1，不砸 0
+  lr_schedule: cosine             # decays to lr*0.1
   batch_size: 1024
-  n_steps: 50000                  # 500k/1024 ≈ 488 steps/epoch → 50k步 ≈ 102 epoch
+  n_steps: 50000                  # 500k/1024 ≈ 488 steps/epoch -> ~102 epochs
   warmup_steps: 2000
   weight_decay: 0.1
   grad_clip: 2.0
   amp: true
-  amp_dtype: bf16
+  amp_dtype: bf16                 # bf16 preferred on Ampere+; same dynamic range as fp32
   compile: true
   seed: 42
   device: cuda
 
 output:
-  model_path: model/teacher_pretrain.pt
-  log_dir: log/teacher_pretrain/
+  model_path: log/teacher_pretrain/teacher_pretrain.pt
+  log_dir: log/teacher_pretrain
 
 logging:
-  log_every: 1000                 # 50k步 / 50 log 点
+  log_every: 1000                 # 50k steps / 50 log points
   eval_batch_size: 256
   eval_data_path: data/eval.jsonl
   n_traj_ckpt: 30
   ckpt_dtype: float16
-  tmp_ckpt_dir: tmp/teacher_pretrain/
+  tmp_ckpt_dir: log/teacher_pretrain/checkpoint
   grid_res: 31
+
+inference:
+  temperature: 0.0                # 0 = greedy; >0 = sampling
+  top_p: 1.0
+  max_new_tokens: 96
+  show_cot: true
+  show_raw: false
+  device: cuda

@@ -1,15 +1,12 @@
+# Training config: teacher model SFT on CoT data.
+# Dataset must be generated first: python data.py --config config/cot_50k_depth5.yaml
+# Usage: python sft.py --config config/teacher_sft.yaml
+#
+# Config name = log subdirectory name (log/teacher_sft/).
+# To start a new training run, create a NEW config file — do not reuse this one.
+
 data:
-  path: data/teacher_sft.jsonl
-  split: teacher_train
-  n_samples: 50000              # CoT 样本比 stmt 长 3-5×，50k 足够 SFT
-  depth_range: [0, 5]           # 全深度，与 pretrain 保持一致
-  operand_len_range: [2, 5]     # 略短于 pretrain [2,8]，提高 ctx=96 的 CoT 过滤通过率
-  n_operands_range: [1, 3]
-  ops_enabled: all
-  check_fraction: 0.0           # 不用检查句（check 数据不含思维链）
-  cot_fraction: 1.0             # ← 全部 CoT：[BOS] EXPR → <think> TRACE </think> = RESULT [EOS]
-  vw_corruption: swap
-  seed: 43
+  path: data/teacher_sft.jsonl    # path to pre-generated CoT dataset
 
 model:
   vocab_size: 34
@@ -19,18 +16,18 @@ model:
   n_heads: 6
   d_head: 32
   d_ffn: 768
-  dropout: 0.0                  # 精调阶段关闭 dropout（pretrain 用 0.1）
+  dropout: 0.0                    # disable dropout during fine-tuning
   tie_embedding: true
   pos_embedding: learned
   norm_type: pre_ln
   activation: gelu
 
 train:
-  base_model_path: model/teacher_pretrain.pt
-  lr: 1.0e-4                    # 比 pretrain (1e-3) 小 10×，保留已有知识
+  base_model_path: log/teacher_pretrain/teacher_pretrain.pt
+  lr: 1.0e-4                      # 10x smaller than pretrain to retain learned knowledge
   lr_schedule: cosine
-  batch_size: 256               # CoT 序列较长，适当小于 pretrain 的 1024
-  n_steps: 5000                 # 50k/256 ≈ 195 steps/epoch → ~25 epochs
+  batch_size: 256                  # CoT sequences are longer; smaller batch than pretrain
+  n_steps: 5000                    # 50k/256 ≈ 195 steps/epoch -> ~25 epochs
   warmup_steps: 200
   weight_decay: 0.1
   grad_clip: 1.0
@@ -41,14 +38,23 @@ train:
   device: cuda
 
 output:
-  model_path: model/teacher_sft.pt
-  log_dir: log/teacher_sft/
+  model_path: log/teacher_sft/teacher_sft.pt
+  log_dir: log/teacher_sft
 
 logging:
-  log_every: 100                # 5000/100 = 50 个 log 点
+  log_every: 100                   # 5000/100 = 50 log points
   eval_batch_size: 256
   eval_data_path: data/eval.jsonl
   n_traj_ckpt: 20
   ckpt_dtype: float16
-  tmp_ckpt_dir: tmp/teacher_sft/
+  tmp_ckpt_dir: log/teacher_sft/checkpoint
   grid_res: 31
+  pca_basis_path: log/teacher_pretrain/pca_basis.npz  # reuse pretrain PCA axes for comparable landscapes
+
+inference:
+  temperature: 0.0
+  top_p: 1.0
+  max_new_tokens: 96
+  show_cot: true
+  show_raw: false
+  device: cuda

@@ -1,0 +1,19 @@
+# Data generation config: 50k CoT-only samples, depth 0-5, teacher split.
+# Usage: python data.py --config config/cot_50k_depth5.yaml
+# Output: data/teacher_sft.jsonl
+# Note: CoT samples are 3-5x longer than plain stmt; 50k is sufficient for SFT.
+
+data:
+  path: data/teacher_sft.jsonl
+  split: teacher_train
+  n_samples: 50000
+  depth_range: [0, 5]
+  operand_len_range: [2, 5]       # slightly shorter than [2,8] to improve ctx=96 filter pass rate
+  n_operands_range: [1, 3]
+  ops_enabled: all
+  check_fraction: 0.0             # no check samples (check data has no CoT trace)
+  cot_fraction: 1.0               # 100% CoT: [BOS] EXPR -> <think> TRACE </think> = RESULT [EOS]
+  vw_corruption: swap
+  seed: 43
+
+context_len: 96

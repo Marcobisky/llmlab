@@ -1,28 +1,26 @@
 """
-inference.py — 对话式推理终端。
-读 config/inference.yaml 获取模型路径和推理参数。
+inference.py — Interactive inference REPL.
+Reads model architecture and inference parameters from a training config yaml.
 
-用法：
-    python inference.py
-    python inference.py config/inference.yaml
-    python inference.py --model model/teacher_pretrain.pt
+Usage:
+    python inference.py --config config/teacher_pretrain.yaml
+    python inference.py --config config/teacher_sft.yaml --model path/to/override.pt
 
-输入格式：
-    rs1234           → 生成模式，计算表达式结果
-    rs1234=4321?     → 验证模式，判断候选答案是否正确
-    :help            → 帮助
-    :cot on/off      → 切换 CoT 轨迹显示
-    :temp 0.8        → 设置采样温度（0=贪心）
-    :model <path>    → 切换模型权重
-    :quit            → 退出
+Input formats:
+    rs1234           -> generate: compute expression result
+    rs1234=4321?     -> verify: judge whether candidate answer is correct
+    :help            -> show help
+    :cot on/off      -> toggle CoT trace display
+    :temp 0.8        -> set sampling temperature (0 = greedy)
+    :model <path>    -> switch model weights at runtime
+    :quit            -> exit
 """
 import argparse
 import os
 import sys
 from pathlib import Path
 
-# macOS 上 PyTorch 与 conda OpenMP 可能各自加载 libomp.dylib，
-# 设置此变量允许共存（不影响正确性，仅推理脚本设置）
+# Prevent OpenMP conflict on macOS (PyTorch + conda may load libomp.dylib twice)
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 from typing import List, Optional, Tuple
 
@@ -30,14 +28,12 @@ import torch
 import torch.nn.functional as F
 import yaml
 
-CONFIG_YAML = "config/inference.yaml"
-
 sys.path.insert(0, str(Path(__file__).parent))
-from lib.lang import TOKEN2ID, interpret
-from model import build_model
+from lib.lang  import TOKEN2ID, interpret
+from lib.model import build_model
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Token 常量
+# Token constants
 # ─────────────────────────────────────────────────────────────────────────────
 
 ID2TOK   = {v: k for k, v in TOKEN2ID.items()}
@@ -48,7 +44,7 @@ Q_ID     = TOKEN2ID['?']
 THINK_ID     = TOKEN2ID.get('<think>',  32)
 THINK_END_ID = TOKEN2ID.get('</think>', 33)
 
-# ANSI 颜色（非 TTY 自动降级）
+# ANSI colors (auto-disabled for non-TTY output)
 _USE_COLOR = sys.stdout.isatty()
 def _c(code: str) -> str:
     return code if _USE_COLOR else ''
@@ -60,13 +56,13 @@ YELLOW = _c('\033[93m')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 表达式 Tokenize
+# Expression tokenization
 # ─────────────────────────────────────────────────────────────────────────────
 
 def tokenize_expr(expr: str) -> List[int]:
     """
-    表达式字符串（无空格）→ token ID 列表。
-    逐字符匹配，先尝试双字符（vc/vw/gw）再单字符。
+    Expression string (no spaces) -> list of token IDs.
+    Tries two-char tokens (vc/vw/gw) before single-char.
     """
     ids, i = [], 0
     while i < len(expr):
@@ -81,7 +77,7 @@ def tokenize_expr(expr: str) -> List[int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 生成
+# Generation
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -94,11 +90,11 @@ def generate(
     device: str,
 ) -> List[int]:
     """
-    自回归生成，返回新生成的 token ID 列表（不含 prompt）。
-    temperature=0 → 贪心；temperature>0 → 采样（可选 top-p nucleus）。
+    Autoregressive generation. Returns newly generated token IDs (excluding prompt).
+    temperature=0 -> greedy; temperature>0 -> sampling with optional top-p nucleus.
     """
     model.eval()
-    context_len = model.pos_emb.num_embeddings   # 96
+    context_len = model.pos_emb.num_embeddings
     ids = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
     # ids: [1, L_prompt]
     generated = []
@@ -107,7 +103,7 @@ def generate(
         if ids.shape[1] >= context_len:
             break
         logits = model(ids)             # [1, T, V]
-        nxt = logits[0, -1]             # [V]  最后位置的 logits
+        nxt = logits[0, -1]             # [V]
 
         if temperature == 0.0:
             next_id = int(nxt.argmax())
@@ -115,7 +111,7 @@ def generate(
             nxt = nxt / temperature
             probs = F.softmax(nxt, dim=-1)
             if top_p < 1.0:
-                # Nucleus sampling（top-p）
+                # nucleus (top-p) sampling
                 sp, si = probs.sort(descending=True)
                 cumsum = sp.cumsum(0)
                 sp[cumsum - sp > top_p] = 0.0
@@ -132,39 +128,39 @@ def generate(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 输出解析
+# Output parsing
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_generated(gen_ids: List[int]) -> Tuple[str, Optional[List[str]], Optional[str]]:
     """
-    解析生成的 token ID 列表，返回 (result, cot_steps, verdict)。
+    Parse generated token IDs into (result, cot_steps, verdict).
 
-    支持三种格式：
-      直接格式   : '= RESULT [EOS]'
-      CoT 格式   : '<think> TRACE </think> = RESULT [EOS]'
-      验证格式   : 'vc/vw/gw [EOS]'
+    Supported formats:
+      Direct : '= RESULT [EOS]'
+      CoT    : '<think> TRACE </think> = RESULT [EOS]'
+      Verify : 'vc/vw/gw [EOS]'
 
-    cot_steps: List[str] 或 None（每个 step 是一个紧凑表达式字符串）
-    verdict  : 'vc'|'vw'|'gw' 或 None
+    cot_steps: List[str] or None (each step is a compact expression string)
+    verdict  : 'vc' | 'vw' | 'gw' or None
     """
     toks = [ID2TOK.get(i, '?') for i in gen_ids]
 
-    # 验证模式输出
+    # verify mode output
     if toks and toks[0] in ('vc', 'vw', 'gw'):
         return '', None, toks[0]
 
-    # CoT trace 提取
+    # CoT trace extraction
     cot_steps = None
     if '<think>' in toks and '</think>' in toks:
         try:
             s = toks.index('<think>') + 1
             e = toks.index('</think>')
-            trace = ''.join(toks[s:e])       # 紧凑字符串，如 'ir23c0=ir230=i032=032'
+            trace = ''.join(toks[s:e])
             cot_steps = [st for st in trace.split('=') if st]
         except ValueError:
             pass
 
-    # 最后一个 '=' 之后的内容为最终结果（兼容直接和 CoT 格式）
+    # last '=' in sequence marks start of final result
     last_eq = max((i for i, t in enumerate(toks) if t == '='), default=-1)
     result = ''
     if last_eq >= 0:
@@ -179,13 +175,13 @@ def parse_generated(gen_ids: List[int]) -> Tuple[str, Optional[List[str]], Optio
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 用户输入解析
+# Input parsing
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_input(raw: str) -> Tuple[Optional[str], str, str]:
     """
-    解析用户输入，返回 (mode, expr, candidate)。
-    mode: 'generate' | 'verify' | None（无效）
+    Parse user input. Returns (mode, expr, candidate).
+    mode: 'generate' | 'verify' | None (invalid)
     """
     s = raw.strip().replace(' ', '')
     if not s:
@@ -203,7 +199,7 @@ def parse_input(raw: str) -> Tuple[Optional[str], str, str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 显示
+# Display
 # ─────────────────────────────────────────────────────────────────────────────
 
 def display_generate(
@@ -217,13 +213,11 @@ def display_generate(
 ):
     correct, valid = interpret(expr)
 
-    # ── Raw token sequence ──────────────────────────────────────────────────
     if show_raw and prompt_ids is not None and gen_ids is not None:
         all_ids = prompt_ids + gen_ids
         raw_str = ' '.join(ID2TOK.get(i, f'?{i}') for i in all_ids)
         print(f"\n  {CYAN}Raw tokens{RESET} : {GRAY}{raw_str}{RESET}")
 
-    # ── CoT trace / result ──────────────────────────────────────────────────
     if show_cot and cot_steps:
         print(f"\n  {CYAN}Expression{RESET} : {BOLD}{expr}{RESET}")
         print(f"  {CYAN}CoT Trace{RESET}  :")
@@ -236,22 +230,21 @@ def display_generate(
             print()
         print(f"  {BOLD}{expr}{RESET}  =  {BOLD}{result}{RESET}")
 
-    # 正确性校验（解释器）
     if valid:
         if result == correct:
-            print(f"  {GREEN}✓ Correct{RESET}")
+            print(f"  {GREEN}Correct{RESET}")
         else:
-            print(f"  {RED}✗ Wrong{RESET}  (correct: {BOLD}{correct}{RESET})")
+            print(f"  {RED}Wrong{RESET}  (correct: {BOLD}{correct}{RESET})")
     else:
-        print(f"  {YELLOW}⚠ Expression syntax invalid{RESET}")
+        print(f"  {YELLOW}Warning: expression syntax invalid{RESET}")
     print()
 
 
 def display_verify(expr: str, candidate: str, verdict: str):
     v_style = {
-        'vc': (GREEN, '✓ correct'),
-        'vw': (RED,   '✗ wrong'),
-        'gw': (RED,   '⚠ invalid expression'),
+        'vc': (GREEN, 'correct'),
+        'vw': (RED,   'wrong'),
+        'gw': (RED,   'invalid expression'),
     }
     color, text = v_style.get(verdict, (RESET, verdict))
 
@@ -267,35 +260,35 @@ def display_verify(expr: str, candidate: str, verdict: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 主函数
+# Model loading
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_model(model_path: str, model_cfg: dict, device: str):
     if not Path(model_path).exists():
-        print(f"{RED}⚠ 模型文件不存在: {model_path}{RESET}")
+        print(f"{RED}Error: model file not found: {model_path}{RESET}")
         sys.exit(1)
     model = build_model(model_cfg).to(device)
     state = torch.load(model_path, map_location=device, weights_only=True)
     model.load_state_dict(state)
     model.eval()
-    # 推理不用 torch.compile：
-    #   1. 交互式单条查询，编译开销远大于收益
-    #   2. macOS 上 compile 会二次加载 libomp.dylib，与 conda OpenMP 冲突 → SIGABRT
+    # Note: torch.compile is intentionally skipped for inference:
+    #   1. Single-query latency; compile overhead far exceeds savings.
+    #   2. On macOS, compile triggers duplicate libomp.dylib load -> SIGABRT.
     return model
 
 
 def print_help(show_cot: bool, show_raw: bool, temperature: float):
     print(f"""
   {BOLD}Commands{RESET}
-    :cot on/off        CoT 轨迹显示（当前: {'on' if show_cot else 'off'}）
-    :raw on/off        完整 token 序列显示，含 [BOS]/[EOS]/<think>（当前: {'on' if show_raw else 'off'}）
-    :temp <0-2>        采样温度（0=贪心，当前: {temperature:.1f}）
-    :model <path>      切换模型权重文件
-    :quit              退出
+    :cot on/off        CoT trace display (current: {'on' if show_cot else 'off'})
+    :raw on/off        Full token sequence display, incl. [BOS]/[EOS]/<think> (current: {'on' if show_raw else 'off'})
+    :temp <0-2>        Sampling temperature (0=greedy, current: {temperature:.1f})
+    :model <path>      Switch model weights file
+    :quit              Exit
 
   {BOLD}Input formats{RESET}
-    rs1234             → 生成：计算表达式结果
-    rs1234=4321?       → 验证：判断候选答案是否正确
+    rs1234             -> generate: compute expression result
+    rs1234=4321?       -> verify: judge whether candidate is correct
 
   {BOLD}Operators{RESET}
     Unary  : i r s S d D h t e o L R p
@@ -308,12 +301,16 @@ def print_help(show_cot: bool, show_raw: bool, temperature: float):
 """)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(description='LLMlab Inference')
-    parser.add_argument('config', nargs='?', default=CONFIG_YAML,
-                        help='yaml 配置文件路径')
+    parser = argparse.ArgumentParser(description='LLMlab Inference REPL')
+    parser.add_argument('--config', required=True,
+                        help='Training config yaml (e.g. config/teacher_pretrain.yaml)')
     parser.add_argument('--model', default=None,
-                        help='模型权重路径（覆盖 yaml 中的 model_path）')
+                        help='Override model weights path from config')
     args = parser.parse_args()
 
     os.chdir(Path(__file__).parent)
@@ -321,7 +318,7 @@ def main():
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    model_path  = args.model or cfg.get('model_path', 'model/teacher_pretrain.pt')
+    model_path  = args.model or cfg['output']['model_path']
     model_cfg   = cfg['model']
     infer_cfg   = cfg.get('inference', {})
     temperature = float(infer_cfg.get('temperature',   0.0))
@@ -333,21 +330,18 @@ def main():
     if device == 'cuda' and not torch.cuda.is_available():
         device = 'cpu'
 
-    # ── 加载模型 ────────────────────────────────────────────────────────────
-    print(f"加载模型: {model_path}  device={device}")
+    print(f"Loading model: {model_path}  device={device}")
     model = load_model(model_path, model_cfg, device)
     ctx = model_cfg['context_len']
 
-    # ── 欢迎界面 ────────────────────────────────────────────────────────────
     print()
-    print('╔' + '═'*58 + '╗')
-    print(f'║  {BOLD}LLMlab Inference{RESET}{" "*42}║')
-    print(f'║  model : {Path(model_path).name:<48}║')
-    print(f'║  ctx   : {ctx:<3}   device: {device:<43}║')
-    print('╚' + '═'*58 + '╝')
-    print(f'  输入表达式计算，:help 查看帮助，:quit 退出\n')
+    print('=' * 60)
+    print(f'  LLMlab Inference')
+    print(f'  model : {Path(model_path).name}')
+    print(f'  ctx   : {ctx}   device: {device}')
+    print('=' * 60)
+    print('  Type expression to compute, :help for commands\n')
 
-    # ── REPL 主循环 ─────────────────────────────────────────────────────────
     def prompt_str():
         parts = []
         if temperature > 0:
@@ -363,20 +357,19 @@ def main():
         try:
             raw = input(prompt_str())
         except (EOFError, KeyboardInterrupt):
-            print(f'\n{GRAY}再见！{RESET}')
+            print(f'\n{GRAY}Goodbye!{RESET}')
             break
 
         raw = raw.strip()
         if not raw:
             continue
 
-        # ── 命令 ────────────────────────────────────────────────────────────
         if raw.startswith(':'):
             parts = raw[1:].strip().lower().split()
             cmd   = parts[0] if parts else ''
 
             if cmd in ('quit', 'exit', 'q'):
-                print(f'{GRAY}再见！{RESET}')
+                print(f'{GRAY}Goodbye!{RESET}')
                 break
 
             elif cmd == 'help':
@@ -400,11 +393,11 @@ def main():
                 if len(parts) > 1:
                     try:
                         temperature = max(0.0, float(parts[1]))
-                        print(f'  温度: {temperature:.2f}')
+                        print(f'  Temperature: {temperature:.2f}')
                     except ValueError:
-                        print(f'  {RED}⚠ 请输入数字，如 :temp 0.8{RESET}')
+                        print(f'  {RED}Error: expected a number, e.g. :temp 0.8{RESET}')
                 else:
-                    print(f'  当前温度: {temperature:.2f}')
+                    print(f'  Current temperature: {temperature:.2f}')
 
             elif cmd == 'model':
                 if len(parts) > 1:
@@ -414,21 +407,20 @@ def main():
                         raw_model = getattr(model, '_orig_mod', model)
                         raw_model.load_state_dict(state)
                         model_path = new_path
-                        print(f'  {GREEN}模型已切换: {new_path}{RESET}')
+                        print(f'  {GREEN}Switched to: {new_path}{RESET}')
                     except Exception as e:
-                        print(f'  {RED}⚠ 加载失败: {e}{RESET}')
+                        print(f'  {RED}Failed to load: {e}{RESET}')
                 else:
-                    print(f'  当前模型: {model_path}')
+                    print(f'  Current model: {model_path}')
 
             else:
-                print(f'  {YELLOW}⚠ 未知命令 :{cmd}，输入 :help 查看帮助{RESET}')
+                print(f'  {YELLOW}Unknown command :{cmd}  — type :help{RESET}')
             continue
 
-        # ── 表达式处理 ──────────────────────────────────────────────────────
         mode, expr, candidate = parse_input(raw)
 
         if mode is None:
-            print(f'  {YELLOW}⚠ 无法解析输入，请检查格式（:help 查看示例）{RESET}\n')
+            print(f'  {YELLOW}Cannot parse input (see :help for examples){RESET}\n')
             continue
 
         if mode == 'generate':
@@ -448,7 +440,7 @@ def main():
                 display_verify(expr, candidate, verdict)
             else:
                 raw_out = ''.join(ID2TOK.get(i, '?') for i in gen)
-                print(f'  {YELLOW}⚠ 模型未输出有效判定 (got: "{raw_out}"){RESET}\n')
+                print(f'  {YELLOW}No valid verdict from model (got: "{raw_out}"){RESET}\n')
 
 
 if __name__ == '__main__':

@@ -1,17 +1,12 @@
+# Training config: student model SFT.
+# Dataset must be generated first: python data.py --config config/stmt_100k_depth5.yaml
+# Usage: python sft.py --config config/student_sft.yaml
+#
+# Config name = log subdirectory name (log/student_sft/).
+# To start a new training run, create a NEW config file — do not reuse this one.
+
 data:
   path: data/student_sft.jsonl
-  split: student_train
-  n_samples: 100000
-  depth_range: [0, 5]
-  operand_len_range: [1, 6]
-  n_operands_range: [1, 3]
-  ops_enabled: all
-  check_fraction: 0.0
-  verdict_ratio: [5, 3, 2]
-  cot_fraction: 0.0
-  vw_corruption: swap
-  noise_rate: 0.0
-  seed: 45
 
 model:
   vocab_size: 34
@@ -28,7 +23,7 @@ model:
   activation: gelu
 
 train:
-  base_model_path: model/student_pretrain.pt
+  base_model_path: log/student_pretrain/student_pretrain.pt
   lr: 1.0e-4
   lr_schedule: cosine
   batch_size: 64
@@ -37,12 +32,15 @@ train:
   weight_decay: 0.1
   grad_clip: 1.0
   loss_on_prompt: false
+  amp: true
+  amp_dtype: bf16
+  compile: false
   seed: 42
   device: cuda
 
 output:
-  model_path: model/student_sft.pt
-  log_dir: log/student_sft/
+  model_path: log/student_sft/student_sft.pt
+  log_dir: log/student_sft
 
 logging:
   log_every: 50
@@ -50,5 +48,14 @@ logging:
   eval_data_path: data/eval.jsonl
   n_traj_ckpt: 30
   ckpt_dtype: float16
-  tmp_ckpt_dir: tmp/student_sft/
+  tmp_ckpt_dir: log/student_sft/checkpoint
   grid_res: 31
+  pca_basis_path: log/student_pretrain/pca_basis.npz  # reuse pretrain PCA axes for comparable landscapes
+
+inference:
+  temperature: 0.0
+  top_p: 1.0
+  max_new_tokens: 96
+  show_cot: false
+  show_raw: false
+  device: cuda

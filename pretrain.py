@@ -1,23 +1,23 @@
 """
-pretrain.py — 预训练脚本，teacher 和 student 共用同一套代码。
-通过 config yaml 的 data / model / train / output / logging 五个块控制所有行为。
+pretrain.py — Pretraining script, shared by teacher and student via config.
+All behaviour is controlled by the five config blocks: data / model / train / output / logging.
 
-用法：
-    python pretrain.py                             # 使用顶部 CONFIG_YAML
-    python pretrain.py config/teacher_pretrain.yaml
+Usage:
+    python pretrain.py --config config/teacher_pretrain.yaml
+    python pretrain.py --config config/student_pretrain.yaml
 
-输出：
-    model/<name>.pt            最终模型权重
-    log/<stage>/config.json    超参记录
-    log/<stage>/metrics.jsonl  每 log_every 步一行标量指标
-    log/<stage>/landscape.npz  训练末 loss landscape（同时删除 tmp/ 下临时权重）
+Outputs (all paths specified in config):
+    log/<name>/<name>.pt           final model weights
+    log/<name>/metrics.jsonl       one scalar-metrics row per log_every steps
+    log/<name>/landscape.npz       loss landscape computed at end of training
 
-GPU 利用率优化：
-    1. GPUDataBuffer — 把整个数据集 tokenize 后一次性放到 GPU，
-       采样 = torch.randint 索引，零 CPU-GPU 数据传输开销。
-    2. AMP (torch.amp.autocast) — float16 前向/反向，tensor core 加速。
-    3. torch.compile (PyTorch ≥ 2.0) — 图编译，进一步提升吞吐。
+GPU utilization optimizations:
+    1. GPUDataBuffer — tokenizes the entire dataset once and pins it on GPU;
+       sampling = torch.randint indexing, zero CPU-GPU transfer overhead.
+    2. AMP (torch.amp.autocast) — float16/bf16 forward/backward, tensor core acceleration.
+    3. torch.compile (PyTorch >= 2.0) — graph compilation for further throughput gains.
 """
+import argparse
 import json
 import math
 import os
@@ -31,38 +31,35 @@ import torch
 import torch.nn as nn
 import yaml
 
-# ── 顶部配置（修改此处选择要运行的 stage） ──────────────────────────────────
-CONFIG_YAML = "config/teacher_pretrain.yaml"
-# ─────────────────────────────────────────────────────────────────────────────
-
 sys.path.insert(0, str(Path(__file__).parent))
-from lib.lang import TOKEN2ID
-from model   import build_model
-from metrics import compute_metrics, save_landscape
+from lib.lang    import TOKEN2ID
+from lib.model   import build_model
+from lib.metrics import compute_metrics, save_landscape
 
-PAD_ID = TOKEN2ID['[EOS]']   # padding token（labels 处用 -100 mask）
+PAD_ID = TOKEN2ID['[EOS]']   # padding token (labels use -100 mask)
 EOS_ID = TOKEN2ID['[EOS]']
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GPU 数据预加载（核心加速手段）
+# GPU data preloading (core speed-up mechanism)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _tokenize_record(rec: Dict, context_len: int, mode: str) -> Tuple[List[int], List[int]]:
     """
-    单条 jsonl 记录 → (inp, lbl) 两个 int 列表，已右 padding 到 context_len-1。
-    mode='pretrain': 全序列计 loss；mode='sft': prompt 部分 label=-100。
+    Single jsonl record -> (inp, lbl) padded to context_len-1.
+    mode='pretrain': full sequence loss.
+    mode='sft': prompt labels set to -100 (only target tokens count).
     """
     C = context_len
     prompt_ids = [TOKEN2ID.get(t, 0) for t in rec['prompt'].split()]
     target_ids = [TOKEN2ID.get(t, 0) for t in rec['target'].split()]
-    full_ids   = (prompt_ids + target_ids)[:C]   # 截断（通常不触发）
+    full_ids   = (prompt_ids + target_ids)[:C]   # truncate (rarely triggered)
 
-    inp = full_ids[:-1]   # [BOS] EXPR = RESULT      长度 L-1
-    lbl = full_ids[1:]    # EXPR = RESULT [EOS]       长度 L-1
+    inp = full_ids[:-1]   # [BOS] EXPR = RESULT      length L-1
+    lbl = full_ids[1:]    # EXPR = RESULT [EOS]       length L-1
 
     if mode == 'sft':
-        # prompt 对应的 input 位置不计 loss（mask 掉）
+        # mask prompt positions so only target tokens contribute to loss
         n_mask = min(len(prompt_ids) - 1, len(inp))
         for i in range(n_mask):
             lbl[i] = -100
@@ -75,19 +72,19 @@ def _tokenize_record(rec: Dict, context_len: int, mode: str) -> Tuple[List[int],
 
 class GPUDataBuffer:
     """
-    把整个训练集一次性加载到 GPU 显存。
+    Preloads the entire training set onto GPU memory.
 
-    为什么这样做：
-      - 数据集很小（50k × 47 tokens × int64 ≈ 18.8 MB），完全放得下。
-      - 采样变成纯 GPU 操作：torch.randint → tensor 索引，
-        消除 DataLoader 的 Python 开销、CPU→GPU 传输、worker 同步等瓶颈。
-      - 实测可把 GPU 利用率从 ~17% 提升到 ~85%+。
+    Why this works:
+      - Dataset is small (50k x 95 tokens x int64 ≈ 38 MB), fits easily on GPU.
+      - Sampling becomes a pure GPU op: torch.randint -> tensor indexing,
+        eliminating DataLoader Python overhead, CPU->GPU transfer, and worker sync.
+      - Lifts GPU utilization from ~17% to ~85%+ in practice.
 
-    inp:  [N, C-1]  int64，token IDs（padding = PAD_ID）
-    lbl:  [N, C-1]  int64，labels（padding = -100）
+    inp:  [N, C-1]  int64, token IDs (padding = PAD_ID)
+    lbl:  [N, C-1]  int64, labels (padding = -100)
     """
     def __init__(self, jsonl_path: str, context_len: int, mode: str, device: str):
-        print(f"  预加载数据集到 {device} ({jsonl_path}) ...")
+        print(f"  Preloading dataset to {device} ({jsonl_path}) ...")
         t0 = time.time()
 
         records = []
@@ -103,18 +100,17 @@ class GPUDataBuffer:
             all_inp.append(inp)
             all_lbl.append(lbl)
 
-        # 一次性转 GPU tensor
         self.inp = torch.tensor(all_inp, dtype=torch.long, device=device)  # [N, C-1]
         self.lbl = torch.tensor(all_lbl, dtype=torch.long, device=device)  # [N, C-1]
         self.N   = self.inp.shape[0]
 
         mb = self.inp.numel() * 2 * 8 / 1e6   # inp + lbl, int64
-        print(f"  已加载 {self.N} 条，显存占用 ≈ {mb:.1f} MB，耗时 {time.time()-t0:.1f}s")
+        print(f"  Loaded {self.N} records, GPU memory ≈ {mb:.1f} MB, time {time.time()-t0:.1f}s")
 
     def sample(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        随机采 batch_size 条（有放回），纯 GPU 操作。
-        返回 (inp [B, C-1], lbl [B, C-1])，已在 GPU 上。
+        Sample batch_size records with replacement, pure GPU op.
+        Returns (inp [B, C-1], lbl [B, C-1]) already on GPU.
         """
         idx = torch.randint(self.N, (batch_size,), device=self.inp.device)
         return self.inp[idx], self.lbl[idx]
@@ -124,9 +120,7 @@ def make_eval_batch(
     eval_records: List[Dict], context_len: int, max_samples: int, device: str,
     mode: str = 'sft',
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """把 eval 记录转成固定 batch（不 shuffle，用于稳定 val_loss 计算）。
-    mode 应与训练保持一致，默认 'sft'（只对 target 算 loss）。
-    """
+    """Convert eval records to a fixed batch (not shuffled, for stable val_loss)."""
     all_inp, all_lbl = [], []
     for rec in eval_records[:max_samples]:
         inp, lbl = _tokenize_record(rec, context_len, mode=mode)
@@ -138,23 +132,22 @@ def make_eval_batch(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LR Schedule
+# LR schedule
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_lr(step: int, n_steps: int, lr: float, warmup_steps: int,
            schedule: str = 'cosine') -> float:
     """
-    Warmup（线性 0→lr）+ cosine 衰减到 lr_min（默认 lr/10）。
-    step 从 1 开始。
+    Linear warmup (0 -> lr over warmup_steps) then cosine decay to lr*0.1.
+    step starts at 1.
 
-    改进：cosine 衰减到 lr/10 而非 0，避免训练末期 LR 砸地板、
-    模型更新完全停止（原来 3000 步末 LR ≈ 2.7e-6，导致 loss 冻住）。
+    Decays to lr*0.1 rather than 0 to avoid the training stall caused by
+    near-zero learning rates at the end (cosine to 0 freezes updates).
     """
     if step <= warmup_steps:
         return lr * step / max(1, warmup_steps)
     if schedule == 'constant':
         return lr
-    # cosine decay：lr → lr * min_ratio
     min_ratio = 0.1
     progress = (step - warmup_steps) / max(1, n_steps - warmup_steps)
     cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -162,25 +155,23 @@ def get_lr(step: int, n_steps: int, lr: float, warmup_steps: int,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tmp Checkpoint 保存
+# Temporary checkpoint (for landscape computation)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_tmp_ckpt(model: nn.Module, tmp_dir: str, step: int, dtype: str = 'float16'):
-    """以 float16 保存当前参数到 tmp_dir/<step>.pt（landscape 用）。"""
+    """Save current parameters as float16 to tmp_dir/<step>.pt (used by landscape)."""
     Path(tmp_dir).mkdir(parents=True, exist_ok=True)
-    # 若 model 被 torch.compile 包装，通过 _orig_mod 取原始模型
-    raw = getattr(model, '_orig_mod', model)
+    raw = getattr(model, '_orig_mod', model)  # unwrap torch.compile if needed
     state = {k: v.half() if dtype == 'float16' else v.clone()
              for k, v in raw.state_dict().items()}
     torch.save(state, Path(tmp_dir) / f"{step:06d}.pt")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 主训练循环
+# Main training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main(config_path: str):
-    # ── 读配置 ─────────────────────────────────────────────────────────────
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
@@ -193,21 +184,21 @@ def main(config_path: str):
     device = train_cfg.get('device', 'cpu')
     if device == 'cuda' and not torch.cuda.is_available():
         device = 'cpu'
-        print("⚠ CUDA 不可用，回退到 CPU")
+        print("Warning: CUDA not available, falling back to CPU")
 
-    # ── NVIDIA GPU 专项设置 ────────────────────────────────────────────────
+    # NVIDIA GPU settings
     if device == 'cuda':
-        # TF32：Ampere+ 对 FP32 matmul 用 TF32 加速（精度影响极小，PyTorch 默认已开启）
+        # TF32: Ampere+ uses TF32 for FP32 matmul (negligible precision loss)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32       = True
-        # 让 PyTorch 自动选择最快的 cuDNN 卷积算法（对固定尺寸输入有效）
+        # auto-select fastest cuDNN conv algorithm for fixed input sizes
         torch.backends.cudnn.benchmark        = True
 
     seed = train_cfg.get('seed', 42)
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    context_len  = model_cfg['context_len']   # 48
+    context_len  = model_cfg['context_len']
     batch_size   = train_cfg['batch_size']
     n_steps      = train_cfg['n_steps']
     warmup_steps = train_cfg['warmup_steps']
@@ -215,55 +206,50 @@ def main(config_path: str):
     lr_schedule  = train_cfg.get('lr_schedule', 'cosine')
     weight_decay = train_cfg.get('weight_decay', 0.1)
     grad_clip    = train_cfg.get('grad_clip', 2.0)
-    # amp_dtype: bf16（推荐 Ampere+）或 fp16（旧 GPU）
-    # BF16 优势：动态范围与 FP32 相同，无需 GradScaler，训练稳定性更好
     _amp_dtype_str = train_cfg.get('amp_dtype', 'bf16')
     _amp_dtype     = torch.bfloat16 if _amp_dtype_str == 'bf16' else torch.float16
     use_amp        = train_cfg.get('amp', True) and device == 'cuda'
     log_every    = log_cfg['log_every']
     eval_bs      = log_cfg['eval_batch_size']
     n_traj_ckpt = log_cfg['n_traj_ckpt']
-    ckpt_dtype   = log_cfg.get('ckpt_dtype', 'float16')
-    tmp_dir      = log_cfg['tmp_ckpt_dir']
-    log_dir      = out_cfg['log_dir']
-    model_path   = out_cfg['model_path']
+    ckpt_dtype      = log_cfg.get('ckpt_dtype', 'float16')
+    tmp_dir         = log_cfg['tmp_ckpt_dir']
+    pca_basis_path  = log_cfg.get('pca_basis_path')   # optional: path to pca_basis.npz from an earlier stage
+    log_dir         = out_cfg['log_dir']
+    model_path      = out_cfg['model_path']
 
     ckpt_interval = max(1, n_steps // n_traj_ckpt)
 
-    # ── 目录准备 ────────────────────────────────────────────────────────────
+    # create output directories
     for d in [log_dir, tmp_dir, str(Path(model_path).parent)]:
         Path(d).mkdir(parents=True, exist_ok=True)
 
-    with open(Path(log_dir) / "config.json", 'w') as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-
-    # ── 构建模型 ────────────────────────────────────────────────────────────
-    print(f"构建模型（context_len={context_len}）...")
+    # build model
+    print(f"Building model (context_len={context_len})...")
     model = build_model(model_cfg).to(device)
 
     base_path = train_cfg.get('base_model_path')
     if base_path and Path(base_path).exists():
-        print(f"加载 base model: {base_path}")
+        print(f"Loading base model: {base_path}")
         model.load_state_dict(
             torch.load(base_path, map_location=device, weights_only=True)
         )
 
-    # torch.compile：若可用则启用，对小模型约有 30-50% 额外提速
+    # torch.compile: ~30-50% additional speedup for small models
     if train_cfg.get('compile', True) and hasattr(torch, 'compile'):
-        print("  torch.compile() 编译中（首次 step 会慢）...")
-        # reduce-overhead：减少 Python/CUDA kernel launch 开销，对小模型效果最好
+        print("  torch.compile() (first step will be slow)...")
+        # reduce-overhead: minimizes Python/CUDA kernel launch overhead
         model = torch.compile(model, mode="reduce-overhead")
 
-    # ── GPU 数据预加载 ───────────────────────────────────────────────────────
+    # GPU data preloading
     data_path = data_cfg['path']
-    # mode='sft'：prompt 部分 label=-100，只对 target（等号右边）计 loss。
-    # pretrain 与 SFT 的区别在于数据，而非 loss 的计算方式：
-    #   pretrain：stmt + check + cot 混合，数据多样，教模型所有句式的计算逻辑
-    #   SFT：只有 stmt（生成任务），专注生成格式
-    # 随机采样的 expression 本身不含计算信息，对它算 loss 等于拟合噪声，不应纳入。
+    # mode='sft': prompt labels are -100; loss computed only on target tokens.
+    # Both pretrain and SFT use this mode — the difference is in the data:
+    #   pretrain: mixed stmt/check/cot, teaches all sentence patterns
+    #   SFT: only one type (e.g. CoT), specializes generation format
     buf = GPUDataBuffer(data_path, context_len, mode='sft', device=device)
 
-    # ── Eval 数据 ────────────────────────────────────────────────────────────
+    # eval data
     eval_data_path = log_cfg.get('eval_data_path', '')
     eval_records: List[Dict] = []
     if Path(eval_data_path).exists():
@@ -272,9 +258,8 @@ def main(config_path: str):
                 line = line.strip()
                 if line:
                     eval_records.append(json.loads(line))
-        print(f"eval 数据: {len(eval_records)} 条  ({eval_data_path})")
+        print(f"Eval data: {len(eval_records)} records  ({eval_data_path})")
     else:
-        # fallback：复用训练集前 eval_bs 条
         with open(data_path) as f:
             for line in f:
                 line = line.strip()
@@ -282,35 +267,34 @@ def main(config_path: str):
                     eval_records.append(json.loads(line))
                 if len(eval_records) >= eval_bs:
                     break
-        print(f"⚠ eval 文件不存在，从训练集借用 {len(eval_records)} 条")
+        print(f"Warning: eval file not found, borrowing {len(eval_records)} records from train set")
 
-    # val_loss 的 loss mask 与训练保持一致（都只对 target 算）
     eval_batch = make_eval_batch(eval_records, context_len, eval_bs, device, mode='sft')
-    # eval_batch: (inp [B, C-1], lbl [B, C-1])，固定不变
+    # eval_batch: (inp [B, C-1], lbl [B, C-1]), fixed throughout training
 
-    # ── 优化器 ──────────────────────────────────────────────────────────────
+    # optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95)
     )
-    # BF16 不需要 GradScaler（动态范围足够，不会 underflow）
-    # FP16 仍需 scaler，保留以兼容旧配置
+    # BF16 does not need GradScaler (dynamic range is sufficient).
+    # FP16 still needs scaler for legacy GPU support.
     scaler = (torch.cuda.amp.GradScaler()
               if use_amp and _amp_dtype == torch.float16 else None)
 
-    # ── 训练循环 ─────────────────────────────────────────────────────────────
+    # training loop
     metrics_path = Path(log_dir) / "metrics.jsonl"
     metrics_file = open(metrics_path, 'w')
 
-    prev_flat: Optional[np.ndarray]  = None
-    grad_norm_t: Optional[torch.Tensor] = None   # 不在热路径调 .item()，只在 log 时拉取
+    prev_flat: Optional[np.ndarray]     = None
+    grad_norm_t: Optional[torch.Tensor] = None  # avoid .item() in hot path
     t_start    = time.time()
-    t_interval = t_start                          # 用于计算区间（而非累计）吞吐
+    t_interval = t_start
 
-    n_epoch_steps = max(1, buf.N // batch_size)  # 每 epoch 步数（仅用于显示）
+    n_epoch_steps = max(1, buf.N // batch_size)
     print(f"\n{'='*60}")
-    print(f"开始预训练  n_steps={n_steps}  batch={batch_size}  device={device}")
-    print(f"  数据量={buf.N}  每 epoch≈{n_epoch_steps} steps  "
-          f"总≈{n_steps/n_epoch_steps:.1f} epochs")
+    print(f"Pretrain  n_steps={n_steps}  batch={batch_size}  device={device}")
+    print(f"  data={buf.N}  steps/epoch≈{n_epoch_steps}  "
+          f"total≈{n_steps/n_epoch_steps:.1f} epochs")
     print(f"  AMP={use_amp}  grad_clip={grad_clip}  lr={lr:.2e}")
     print(f"{'='*60}\n")
 
@@ -321,10 +305,10 @@ def main(config_path: str):
         for pg in optimizer.param_groups:
             pg['lr'] = cur_lr
 
-        # ── 采样 + 前向（AMP） ───────────────────────────────────────────
+        # sample + forward (AMP)
         inp_ids, labels = buf.sample(batch_size)
-        # inp_ids: [B=batch_size, T=C-1=47]
-        # labels:  [B, T]，-100 位置被 CE 忽略
+        # inp_ids: [B=batch_size, T=C-1]
+        # labels:  [B, T], -100 positions ignored by CE
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -334,26 +318,24 @@ def main(config_path: str):
         ):
             _, loss = model(inp_ids, labels)
 
-        if scaler is not None:          # FP16 路径
+        if scaler is not None:          # FP16 path
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm_t = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
-        else:                           # BF16 / 无 AMP 路径：省去 Scaler 开销
+        else:                           # BF16 / no AMP: skip Scaler overhead
             loss.backward()
             grad_norm_t = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-        # ↑ 不调 .item()，避免每步强制 CPU-GPU 同步（热路径关键！）
+        # avoid .item() in hot path; CPU-GPU sync deferred to log steps
 
-        # ── 保存 tmp checkpoint ─────────────────────────────────────────
+        # save trajectory checkpoint
         if step % ckpt_interval == 0 or step == 1:
             save_tmp_ckpt(model, tmp_dir, step, ckpt_dtype)
 
-        # ── 指标记录 ────────────────────────────────────────────────────
+        # metrics logging
         if step % log_every == 0 or step == n_steps:
-            # 区间吞吐（本 log_every 步的实际速度，排除上一区间的 eval 开销）
-            # 此处首次出现 .item()，触发一次 CPU-GPU 同步（每 log_every 步一次）
             now         = time.time()
             interval_s  = now - t_interval
             t_interval  = now
@@ -379,34 +361,38 @@ def main(config_path: str):
                 f"step {step:6d}/{n_steps} | lr={cur_lr:.2e} | "
                 f"loss={m['train_loss']:.4f} | val={m['val_loss']:.4f} | "
                 f"acc={m['task_acc']:.3f} | gnorm={grad_norm_val:.2f} | "
-                f"{tps/1000:.1f}k tok/s (interval)"
+                f"{tps/1000:.1f}k tok/s"
             )
 
     metrics_file.close()
 
-    # ── 保存最终权重 ────────────────────────────────────────────────────────
+    # save final weights
     raw_model = getattr(model, '_orig_mod', model)
     torch.save(raw_model.state_dict(), model_path)
-    print(f"\n模型已保存: {model_path}")
+    print(f"\nModel saved: {model_path}")
 
-    # ── Loss Landscape ──────────────────────────────────────────────────────
-    print("\n计算 Loss Landscape...")
+    # loss landscape
+    print("\nComputing loss landscape...")
     save_landscape(
-        model        = raw_model,
-        tmp_ckpt_dir = tmp_dir,
-        eval_batch   = eval_batch,
-        device       = device,
-        log_dir      = log_dir,
-        grid_res     = log_cfg.get('grid_res', 31),
-        alpha_range  = tuple(log_cfg.get('landscape_alpha_range', [-1.0, 1.0])),
-        beta_range   = tuple(log_cfg.get('landscape_beta_range',  [-1.0, 1.0])),
+        model           = raw_model,
+        tmp_ckpt_dir    = tmp_dir,
+        eval_batch      = eval_batch,
+        device          = device,
+        log_dir         = log_dir,
+        grid_res        = log_cfg.get('grid_res', 31),
+        alpha_range     = tuple(log_cfg.get('landscape_alpha_range', [-1.0, 1.0])),
+        beta_range      = tuple(log_cfg.get('landscape_beta_range',  [-1.0, 1.0])),
+        pca_basis_path  = pca_basis_path,
     )
 
     total_min = (time.time() - t_start) / 60
-    print(f"\n训练完成，总耗时 {total_min:.1f} min。日志: {log_dir}")
+    print(f"\nTraining complete. Total time: {total_min:.1f} min. Log: {log_dir}")
 
 
 if __name__ == '__main__':
-    config_path = sys.argv[1] if len(sys.argv) > 1 else CONFIG_YAML
+    parser = argparse.ArgumentParser(description='Pretraining')
+    parser.add_argument('--config', required=True,
+                        help='Path to training config yaml (e.g. config/teacher_pretrain.yaml)')
+    args = parser.parse_args()
     os.chdir(Path(__file__).parent)
-    main(config_path)
+    main(args.config)

@@ -1,8 +1,12 @@
+# Training config: student model knowledge distillation from teacher.
+# Requires: log/student_sft/student_sft.pt and a trained teacher model.
+# Usage: python kd.py --config config/student_kd.yaml
+#
+# Config name = log subdirectory name (log/student_kd/).
+# To start a new training run, create a NEW config file — do not reuse this one.
+
 data:
-  path: data/student_sft.jsonl    # teacher 在这些 prompt 上 rollout
-  split: student_train
-  depth_range: [0, 5]
-  seed: 42
+  path: data/student_sft.jsonl    # teacher rolls out on these prompts
 
 model:
   vocab_size: 34
@@ -19,8 +23,8 @@ model:
   activation: gelu
 
 train:
-  base_model_path: model/student_sft.pt
-  teacher_model_path: model/teacher_final.pt
+  base_model_path: log/student_sft/student_sft.pt
+  teacher_model_path: log/teacher_grpo/teacher_grpo.pt   # distillation source
   lr: 1.0e-4
   lr_schedule: cosine
   batch_size: 64
@@ -29,15 +33,15 @@ train:
   weight_decay: 0.0
   grad_clip: 1.0
   kl_direction: forward           # forward | reverse
-  temperature: 1.0                # softmax 温度（蒸馏时平滑 logits）
-  alpha_ce: 0.0                   # CE loss 混合比（0 = 纯 KL）
+  temperature: 1.0                # softmax temperature for distillation
+  alpha_ce: 0.0                   # CE loss mix ratio (0 = pure KL)
   loss_on_prompt: false
   seed: 42
   device: cuda
 
 output:
-  model_path: model/student_kd.pt
-  log_dir: log/student_kd/
+  model_path: log/student_kd/student_kd.pt
+  log_dir: log/student_kd
 
 logging:
   log_every: 50
@@ -45,5 +49,14 @@ logging:
   eval_data_path: data/eval.jsonl
   n_traj_ckpt: 30
   ckpt_dtype: float16
-  tmp_ckpt_dir: tmp/student_kd/
+  tmp_ckpt_dir: log/student_kd/checkpoint
   grid_res: 31
+  pca_basis_path: log/student_pretrain/pca_basis.npz  # reuse pretrain PCA axes for comparable landscapes
+
+inference:
+  temperature: 0.0
+  top_p: 1.0
+  max_new_tokens: 96
+  show_cot: false
+  show_raw: false
+  device: cuda

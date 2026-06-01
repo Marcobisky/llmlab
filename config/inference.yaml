@@ -1,22 +1,3 @@
-model_path: model/teacher_pretrain.pt   # 当前可用；后续改成 teacher_final.pt
-
-model:                                   # 必须与训练时一致（teacher 尺寸）
-  vocab_size: 34
-  context_len: 96
-  d_model: 192
-  n_layers: 6
-  n_heads: 6
-  d_head: 32
-  d_ffn: 768
-  dropout: 0.0
-  tie_embedding: true
-  pos_embedding: learned
-  norm_type: pre_ln
-  activation: gelu
-
-inference:
-  temperature: 0.0                       # 0=贪心；>0=采样
-  top_p: 1.0
-  max_new_tokens: 96
-  show_cot: true
-  device: cuda
+# DEPRECATED: inference settings are now part of each training config (inference: block).
+# Use: python inference.py --config config/teacher_pretrain.yaml
+# This file is kept for git history only.

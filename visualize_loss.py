@@ -1,22 +1,22 @@
 """
-visualize_loss.py — 只读 log/*/metrics.jsonl，生成图 A-D。
+visualize_loss.py — Reads log/*/metrics.jsonl and generates loss/accuracy plots.
 
-图 A: train_loss / val_loss 曲线（所有 stage 叠加）
-图 B: mean_reward 曲线（GRPO stage）
-图 C: task_acc_by_depth 柱状图（每个 stage 一张，或叠加对比）
-图 D: exposure bias（kl_student_prefix - kl_teacher_prefix，KD/OPD stage）
+All plots are saved to log/<config_name>/fig/ (derived from the --config argument).
+The script scans all log/* subdirectories so multi-stage comparison plots include
+every available stage.
 
-用法：
-    python visualize_loss.py              # 自动扫描 log/*/metrics.jsonl
-    python visualize_loss.py --out figures/  # 指定输出目录
+Plots:
+    A: train_loss / val_loss curves (all stages overlaid)
+    B: mean_reward curves (GRPO stages only)
+    C: task_acc_by_depth bar chart (final checkpoint per stage)
+    D: exposure bias (kl_student_prefix - kl_teacher_prefix, KD/OPD stages)
 
-输出：
-    log/figures/A_loss_curves.png
-    log/figures/B_reward_curves.png
-    log/figures/C_acc_by_depth.png
-    log/figures/D_exposure_bias.png
+Usage:
+    python visualize_loss.py --config config/teacher_pretrain.yaml
 """
+import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List
@@ -25,19 +25,15 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+import yaml
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 加载所有 metrics.jsonl
-# ─────────────────────────────────────────────────────────────────────────────
-
-# stage 顺序决定图例顺序和颜色
+# stage order determines legend ordering and color assignment
 STAGE_ORDER = [
     'teacher_pretrain', 'teacher_sft', 'teacher_grpo', 'teacher_sdpo',
     'student_pretrain', 'student_sft',
     'student_kd', 'student_opd', 'student_grpo',
 ]
 
-# stage → 颜色（matplotlib named color）
 COLORS = {
     'teacher_pretrain': '#1f77b4',
     'teacher_sft':      '#aec7e8',
@@ -53,8 +49,8 @@ COLORS = {
 
 def load_all_metrics(log_root: str = 'log') -> Dict[str, List[Dict]]:
     """
-    扫描 log/*/metrics.jsonl，按 stage 名归组。
-    返回 {stage_name: [row_dict, ...]}。
+    Scan log/*/metrics.jsonl and group by stage name.
+    Returns {stage_name: [row_dict, ...]}.
     """
     data = {}
     log_path = Path(log_root)
@@ -79,7 +75,6 @@ def load_all_metrics(log_root: str = 'log') -> Dict[str, List[Dict]]:
 
 
 def _sorted_stages(data: Dict) -> List[str]:
-    """按 STAGE_ORDER 排列，未知 stage 追加在后。"""
     known   = [s for s in STAGE_ORDER if s in data]
     unknown = [s for s in data if s not in STAGE_ORDER]
     return known + unknown
@@ -89,8 +84,8 @@ def _color(stage: str) -> str:
     return COLORS.get(stage, '#7f7f7f')
 
 
-def _col(rows: List[Dict], key: str) -> np.ndarray:
-    """从 row list 中提取某字段（跳过 None），返回 (steps, values) 对。"""
+def _col(rows: List[Dict], key: str):
+    """Extract a field from row list (skip None values), returns (steps, values) arrays."""
     steps, vals = [], []
     for r in rows:
         v = r.get(key)
@@ -101,7 +96,7 @@ def _col(rows: List[Dict], key: str) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 图 A: Loss 曲线
+# Plot A: Loss curves
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_loss_curves(data: Dict, out_dir: Path):
@@ -131,11 +126,11 @@ def plot_loss_curves(data: Dict, out_dir: Path):
     out = out_dir / 'A_loss_curves.png'
     fig.savefig(out, dpi=150)
     plt.close(fig)
-    print(f"  图 A 已保存: {out}")
+    print(f"  Plot A saved: {out}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 图 B: Reward 曲线（GRPO stage）
+# Plot B: Reward curves (GRPO stages)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_reward_curves(data: Dict, out_dir: Path):
@@ -150,7 +145,7 @@ def plot_reward_curves(data: Dict, out_dir: Path):
 
     if not has_data:
         plt.close(fig)
-        print("  图 B 无 GRPO reward 数据，跳过。")
+        print("  Plot B: no GRPO reward data, skipped.")
         return
 
     ax.set_xlabel('Step')
@@ -163,21 +158,21 @@ def plot_reward_curves(data: Dict, out_dir: Path):
     out = out_dir / 'B_reward_curves.png'
     fig.savefig(out, dpi=150)
     plt.close(fig)
-    print(f"  图 B 已保存: {out}")
+    print(f"  Plot B saved: {out}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 图 C: Task Accuracy by Depth（最后一步的柱状图）
+# Plot C: Task accuracy by depth (final checkpoint bar chart)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_acc_by_depth(data: Dict, out_dir: Path):
     stages = _sorted_stages(data)
     n      = len(stages)
     if n == 0:
-        print("  图 C 无数据，跳过。")
+        print("  Plot C: no data, skipped.")
         return
 
-    depths = list(range(6))   # depth 0-5
+    depths = list(range(6))
     x      = np.arange(len(depths))
     width  = 0.8 / max(n, 1)
 
@@ -185,7 +180,6 @@ def plot_acc_by_depth(data: Dict, out_dir: Path):
 
     for i, stage in enumerate(stages):
         rows = data[stage]
-        # 取最后一个有 task_acc_by_depth 的行
         accs = None
         for row in reversed(rows):
             v = row.get('task_acc_by_depth')
@@ -195,17 +189,14 @@ def plot_acc_by_depth(data: Dict, out_dir: Path):
         if accs is None:
             continue
 
-        # 对齐到 6 个 depth
-        accs_padded = list(accs) + [0.0] * max(0, 6 - len(accs))
-        accs_padded = accs_padded[:6]
-
+        accs_padded = (list(accs) + [0.0] * max(0, 6 - len(accs)))[:6]
         offset = (i - n / 2 + 0.5) * width
         ax.bar(x + offset, accs_padded, width=width,
                label=stage, color=_color(stage), alpha=0.85)
 
     ax.set_xlabel('Depth')
     ax.set_ylabel('Accuracy')
-    ax.set_title('Task Accuracy by Depth (Final checkpoint)')
+    ax.set_title('Task Accuracy by Depth (Final Checkpoint)')
     ax.set_xticks(x)
     ax.set_xticklabels([f'd={d}' for d in depths])
     ax.set_ylim(0, 1.05)
@@ -216,11 +207,11 @@ def plot_acc_by_depth(data: Dict, out_dir: Path):
     out = out_dir / 'C_acc_by_depth.png'
     fig.savefig(out, dpi=150)
     plt.close(fig)
-    print(f"  图 C 已保存: {out}")
+    print(f"  Plot C saved: {out}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 图 D: Exposure Bias（kl_student_prefix - kl_teacher_prefix 随步数变化）
+# Plot D: Exposure bias (kl_student_prefix - kl_teacher_prefix over steps)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_exposure_bias(data: Dict, out_dir: Path):
@@ -243,7 +234,6 @@ def plot_exposure_bias(data: Dict, out_dir: Path):
             ax_abs.plot(steps_t, kl_t, label=f'{stage} (teacher prefix)',
                         color=color, linestyle='--')
 
-        # exposure bias = student_prefix KL - teacher_prefix KL（同 step）
         common_steps = set(steps_s.tolist()) & set(steps_t.tolist())
         if common_steps:
             s2kl_s = dict(zip(steps_s.tolist(), kl_s.tolist()))
@@ -254,7 +244,7 @@ def plot_exposure_bias(data: Dict, out_dir: Path):
 
     if not has_data:
         plt.close(fig)
-        print("  图 D 无 KL 数据（pretrain 阶段正常），跳过。")
+        print("  Plot D: no KL data (normal for pretrain stages), skipped.")
         return
 
     ax_abs.set_title('KL on Teacher / Student Prefix')
@@ -263,9 +253,9 @@ def plot_exposure_bias(data: Dict, out_dir: Path):
     ax_abs.legend(fontsize=6)
     ax_abs.grid(True, alpha=0.3)
 
-    ax_bias.set_title('Exposure Bias (student_prefix_KL − teacher_prefix_KL)')
+    ax_bias.set_title('Exposure Bias (student_prefix_KL - teacher_prefix_KL)')
     ax_bias.set_xlabel('Step')
-    ax_bias.set_ylabel('ΔKL')
+    ax_bias.set_ylabel('Delta KL')
     ax_bias.axhline(0, color='k', linewidth=0.8, linestyle='--')
     ax_bias.legend(fontsize=8)
     ax_bias.grid(True, alpha=0.3)
@@ -274,40 +264,43 @@ def plot_exposure_bias(data: Dict, out_dir: Path):
     out = out_dir / 'D_exposure_bias.png'
     fig.savefig(out, dpi=150)
     plt.close(fig)
-    print(f"  图 D 已保存: {out}")
+    print(f"  Plot D saved: {out}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 入口
+# Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--log',  default='log',     help='log 根目录')
-    parser.add_argument('--out',  default='',        help='图片输出目录（默认 log/figures/）')
+    parser = argparse.ArgumentParser(description='Loss / accuracy visualizer')
+    parser.add_argument('--config', required=True,
+                        help='Training config yaml; determines output fig dir (log/<name>/fig/)')
     args = parser.parse_args()
 
-    out_dir = Path(args.out) if args.out else Path(args.log) / 'figures'
+    os.chdir(Path(__file__).parent)
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    log_dir = cfg['output']['log_dir']
+    out_dir = Path(log_dir) / 'fig'
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"扫描 {args.log}/*/metrics.jsonl ...")
-    data = load_all_metrics(args.log)
+    print(f"Scanning log/*/metrics.jsonl ...")
+    data = load_all_metrics('log')
     if not data:
-        print("未找到任何 metrics.jsonl，退出。")
+        print("No metrics.jsonl files found, exiting.")
         return
 
-    print(f"找到 {len(data)} 个 stage: {list(data.keys())}\n")
+    print(f"Found {len(data)} stage(s): {list(data.keys())}\n")
 
     plot_loss_curves(data, out_dir)
     plot_reward_curves(data, out_dir)
     plot_acc_by_depth(data, out_dir)
     plot_exposure_bias(data, out_dir)
 
-    print(f"\n所有图已保存到 {out_dir}")
+    print(f"\nAll plots saved to {out_dir}")
 
 
 if __name__ == '__main__':
-    import os
-    os.chdir(Path(__file__).parent)
     main()
