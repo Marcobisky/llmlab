@@ -6,7 +6,7 @@
 # To start a new training run, create a NEW config file — do not reuse this one.
 
 data:
-  path: data/student_sft.jsonl    # only prompts used; student generates rollouts
+  path: data/expr_500k_depth5.jsonl    # only prompts used; student generates rollouts
 
 model:
   vocab_size: 34
@@ -23,7 +23,7 @@ model:
   activation: gelu
 
 train:
-  base_model_path: log/student_sft/student_sft.pt
+  base_model_path: log/student_pretrain/student_pretrain.pt
   teacher_model_path: log/teacher_grpo/teacher_grpo.pt
   lr: 5.0e-5
   lr_schedule: cosine
