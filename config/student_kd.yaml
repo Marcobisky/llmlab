@@ -45,6 +45,7 @@ output:
 
 logging:
   log_every: 50
+  eval_every: 200              # full eval every 200 steps
   eval_batch_size: 256
   eval_data_path: data/eval_10k_depth5.jsonl
   n_traj_ckpt: 30

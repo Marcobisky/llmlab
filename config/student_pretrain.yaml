@@ -42,6 +42,7 @@ output:
 
 logging:
   log_every: 1000
+  eval_every: 5000             # full eval every 5k steps -> ~10 eval points
   eval_batch_size: 256
   eval_data_path: data/eval_10k_depth5.jsonl
   n_traj_ckpt: 30

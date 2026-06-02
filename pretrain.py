@@ -174,11 +174,17 @@ def save_tmp_ckpt(model: nn.Module, tmp_dir: str, step: int, dtype: str = 'float
     """
     global _ckpt_thread
 
+    # With torch.compile(reduce-overhead), CUDA ops are submitted asynchronously.
+    # Sync the stream BEFORE timing so the measured time is only the CPU copy,
+    # not the accumulated async GPU work from the training steps.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
     t0 = time.time()
     Path(tmp_dir).mkdir(parents=True, exist_ok=True)
     raw = getattr(model, '_orig_mod', model)  # unwrap torch.compile if needed
 
-    # Copy parameters to CPU first (in calling thread: fast, forces GPU sync)
+    # Copy parameters to CPU first (in calling thread: fast after sync above)
     if dtype == 'float16':
         state_cpu = {k: v.half().cpu() for k, v in raw.state_dict().items()}
     else:
@@ -251,6 +257,10 @@ def main(config_path: str):
     pca_basis_path  = log_cfg.get('pca_basis_path')   # optional: path to pca_basis.npz from an earlier stage
     log_dir         = out_cfg['log_dir']
     model_path      = out_cfg['model_path']
+    # eval_every: how often to run the full (slow) eval: val_loss + greedy-decode task_acc.
+    # Defaults to log_every so existing configs keep their current behaviour unchanged.
+    # Set to a larger multiple of log_every to reduce eval overhead.
+    eval_every      = log_cfg.get('eval_every', log_every)
 
     ckpt_interval = max(1, n_steps // n_traj_ckpt)
 
@@ -352,7 +362,7 @@ def main(config_path: str):
     print(f"  data={buf.N}  steps/epoch≈{n_epoch_steps}  "
           f"total≈{n_steps/n_epoch_steps:.1f} epochs")
     print(f"  AMP={use_amp}  grad_clip={grad_clip}  lr={lr:.2e}")
-    print(f"  ckpt_interval={ckpt_interval}  log_every={log_every}")
+    print(f"  ckpt_interval={ckpt_interval}  log_every={log_every}  eval_every={eval_every}")
     print(f"{'='*60}\n")
 
     for step in range(1, n_steps + 1):
@@ -402,41 +412,66 @@ def main(config_path: str):
 
         # ── metrics logging ──────────────────────────────────────────────────
         if step % log_every == 0 or step == n_steps:
-            now        = time.time()
-            interval_s = now - t_interval
-            t_interval = now
+            t_interval = time.time()   # reset interval clock
 
-            grad_norm_val = grad_norm_t.item() if grad_norm_t is not None else 0.0
+            train_loss_val = loss.item()
+            grad_norm_val  = grad_norm_t.item() if grad_norm_t is not None else 0.0
+            # tps uses pure training time (excludes ckpt + eval overhead)
+            tps = log_every * batch_size * (context_len - 1) / max(t_train_s, 1e-6)
 
-            t_eval = time.time()
-            raw_model = getattr(model, '_orig_mod', model)
-            m, prev_flat = compute_metrics(
-                model            = raw_model,
-                eval_batch       = eval_batch,
-                eval_records     = eval_records[:eval_bs],
-                device           = device,
-                step             = step,
-                train_loss       = loss.item(),
-                grad_norm        = grad_norm_val,
-                prev_flat_params = prev_flat,
+            timing_suffix = (
+                f"[train={t_train_s*1000/log_every:.1f}ms/step "
+                f"ckpt={t_ckpt_s*1000:.0f}ms×{n_ckpts_in_interval}"
             )
-            t_eval_s = time.time() - t_eval
+
+            # full eval (val_loss + greedy-decode task_acc): only every eval_every steps
+            do_eval = (step % eval_every == 0) or (step == n_steps)
+
+            if do_eval:
+                t_eval = time.time()
+                raw_model = getattr(model, '_orig_mod', model)
+                m, prev_flat = compute_metrics(
+                    model            = raw_model,
+                    eval_batch       = eval_batch,
+                    eval_records     = eval_records[:eval_bs],
+                    device           = device,
+                    step             = step,
+                    train_loss       = train_loss_val,
+                    grad_norm        = grad_norm_val,
+                    prev_flat_params = prev_flat,
+                )
+                t_eval_s = time.time() - t_eval
+                timing_suffix += f" eval={t_eval_s*1000:.0f}ms]"
+                print(
+                    f"step {step:6d}/{n_steps} | lr={cur_lr:.2e} | "
+                    f"loss={m['train_loss']:.4f} | val={m['val_loss']:.4f} | "
+                    f"acc={m['task_acc']:.3f} | gnorm={grad_norm_val:.2f} | "
+                    f"{tps/1000:.1f}k tok/s | {timing_suffix}"
+                )
+            else:
+                # lightweight row: only train_loss and grad_norm; val/acc fields are null
+                m = {
+                    "step":              step,
+                    "train_loss":        round(train_loss_val, 6),
+                    "val_loss":          None,
+                    "task_acc":          None,
+                    "task_acc_by_depth": None,
+                    "kl_teacher_prefix": None,
+                    "kl_student_prefix": None,
+                    "mean_reward":       None,
+                    "kl_to_ref":         None,
+                    "grad_norm":         round(grad_norm_val, 6),
+                    "param_step_norm":   None,
+                }
+                timing_suffix += "]"
+                print(
+                    f"step {step:6d}/{n_steps} | lr={cur_lr:.2e} | "
+                    f"loss={m['train_loss']:.4f} | gnorm={grad_norm_val:.2f} | "
+                    f"{tps/1000:.1f}k tok/s | {timing_suffix}"
+                )
 
             metrics_file.write(json.dumps(m) + '\n')
             metrics_file.flush()
-
-            # tps based on pure training time only (excluding ckpt and eval overhead)
-            tps = log_every * batch_size * (context_len - 1) / max(t_train_s, 1e-6)
-
-            print(
-                f"step {step:6d}/{n_steps} | lr={cur_lr:.2e} | "
-                f"loss={m['train_loss']:.4f} | val={m['val_loss']:.4f} | "
-                f"acc={m['task_acc']:.3f} | gnorm={grad_norm_val:.2f} | "
-                f"{tps/1000:.1f}k tok/s | "
-                f"[train={t_train_s*1000/log_every:.1f}ms/step "
-                f"ckpt={t_ckpt_s*1000:.0f}ms×{n_ckpts_in_interval} "
-                f"eval={t_eval_s*1000:.0f}ms]"
-            )
 
             # reset interval accumulators
             t_train_s  = 0.0
