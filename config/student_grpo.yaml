@@ -1,5 +1,5 @@
 # Training config: student model GRPO alignment.
-# Requires: log/student_sft/student_sft.pt
+# Requires: log/student_pretrain/student_pretrain.pt
 # Usage: python grpo.py --config config/student_grpo.yaml
 #
 # Config name = log subdirectory name (log/student_grpo/).

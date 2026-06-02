@@ -7,7 +7,7 @@
 核心结构：
 - **解释器** = ground truth（真正的"上帝"），零成本生成无限数据，完美验证任何输出。
 - **teacher 模型 $\Pi_T$** = 较大的 Transformer，走完整 pipeline（pretrain → SFT → GRPO/SDPO）训成强 teacher，为 KD/OPD 提供有熵的 soft 分布。**只在浅组合（depth ≤ 3）上训练，故在深组合上不完美。**
-- **student 模型 $\pi_\theta$** = 较小的 Transformer，pretrain → SFT 作为公共热身，再分三条支路（KD / OPD / GRPO）对比。
+- **student 模型 $\pi_\theta$** = 较小的 Transformer。`student_pretrain` 是所有 student 后训练的共同起点；`student_sft`、`student_kd`、`student_opd`、`student_grpo` 都从同一个 pretrain checkpoint 分叉，互相之间不串联 warm-start。
 
 ---
 
@@ -166,10 +166,10 @@ python grpo.py     --config config/teacher_grpo.yaml         # pretrain -> RLVR 
 
 # 3. Student pipeline
 python pretrain.py --config config/student_pretrain.yaml
-python sft.py      --config config/student_sft.yaml          # shared starting point
-python kd.py       --config config/student_kd.yaml           # off-policy soft label
-python opd.py      --config config/student_opd.yaml          # on-policy soft label
-python grpo.py     --config config/student_grpo.yaml         # verifiable reward
+python sft.py      --config config/student_sft.yaml          # hard-label branch from student_pretrain
+python kd.py       --config config/student_kd.yaml           # off-policy soft-label branch from student_pretrain
+python opd.py      --config config/student_opd.yaml          # on-policy soft-label branch from student_pretrain
+python grpo.py     --config config/student_grpo.yaml         # verifier-reward branch from student_pretrain
 
 # 4. Visualization（--config 决定输出目录 log/<name>/fig/）
 python visualize_loss.py   --config config/teacher_pretrain.yaml
@@ -208,6 +208,7 @@ train:
 ```
 
 teacher GRPO 的 policy warm-start 和 KL reference 都使用 pretrain 后的模型，不依赖 `teacher_sft.pt`。
+Student 的 SFT、KD、OPD、GRPO 也全部使用 `log/student_pretrain/student_pretrain.pt` 作为 `base_model_path`；这些后训练阶段是平行 ablation，不以上一个 student 后训练阶段作为起点。
 
 训练循环：
 

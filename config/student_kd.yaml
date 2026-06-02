@@ -1,5 +1,5 @@
 # Training config: student model knowledge distillation from teacher.
-# Requires: log/student_sft/student_sft.pt and a trained teacher model.
+# Requires: log/student_pretrain/student_pretrain.pt and a trained teacher model.
 # Usage: python kd.py --config config/student_kd.yaml
 #
 # Config name = log subdirectory name (log/student_kd/).
@@ -25,16 +25,18 @@ model:
 train:
   base_model_path: log/student_pretrain/student_pretrain.pt
   teacher_model_path: log/teacher_grpo/run_00/teacher_grpo_run_00.pt   # distillation source
-  lr: 1.0e-4
+  lr: 5.0e-5
   lr_schedule: cosine
-  batch_size: 64
-  n_steps: 800
-  warmup_steps: 80
+  batch_size: 128
+  n_steps: 3000
+  warmup_steps: 200
   weight_decay: 0.0
   grad_clip: 1.0
   kl_direction: forward           # forward | reverse
-  temperature: 1.0                # softmax temperature for distillation
-  alpha_ce: 0.0                   # CE loss mix ratio (0 = pure KL)
+  temperature: 2.0                # soften teacher distribution for the small student
+  alpha_ce: 0.1                   # mix teacher-sampled token CE with soft KL
+  rollout_min_depth: 3            # focus KD on hard prompts instead of already-solved shallow cases
+  rollout_max_depth: 5
   loss_on_prompt: false
   seed: 42
   device: cuda
@@ -45,8 +47,9 @@ output:
 
 logging:
   log_every: 50
-  eval_every: 200              # full eval every 200 steps
+  eval_every: 300              # full eval every 300 steps
   eval_batch_size: 256
+  kl_metric_batch_size: 256
   eval_data_path: data/eval_10k_depth5.jsonl
   save_ckpt: false                # post-training reuses pretrain PCA basis; no checkpoints needed
   n_traj_ckpt: 30

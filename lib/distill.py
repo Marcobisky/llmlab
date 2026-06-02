@@ -36,7 +36,13 @@ def tokenize_prompt(prompt: str) -> List[int]:
 
 class PromptBuffer:
     """Prompt sampler grouped by prompt length for direct tensor stacking."""
-    def __init__(self, jsonl_path: str, context_len: int):
+    def __init__(
+        self,
+        jsonl_path: str,
+        context_len: int,
+        min_depth: int = 0,
+        max_depth: Optional[int] = None,
+    ):
         groups: Dict[int, List[Dict]] = defaultdict(list)
 
         with open(jsonl_path) as f:
@@ -49,13 +55,18 @@ class PromptBuffer:
                     continue
                 if 'expr' not in rec or 'result' not in rec:
                     continue
+                depth = int(rec.get('depth', 0))
+                if depth < min_depth:
+                    continue
+                if max_depth is not None and depth > max_depth:
+                    continue
                 prompt_ids = tokenize_prompt(rec['prompt'])
                 if 0 < len(prompt_ids) < context_len:
                     groups[len(prompt_ids)].append({
                         'prompt_ids': prompt_ids,
                         'expr': rec.get('expr'),
                         'result': rec.get('result'),
-                        'depth': rec.get('depth', 0),
+                        'depth': depth,
                     })
 
         if not groups:
@@ -405,9 +416,19 @@ def run_distillation(config_path: str, mode: str):
     if not teacher_model_path or not Path(teacher_model_path).exists():
         raise FileNotFoundError(f"teacher_model_path not found: {teacher_model_path}")
 
+    rollout_min_depth = int(train_cfg.get('rollout_min_depth', 0))
+    rollout_max_depth = train_cfg.get('rollout_max_depth')
+    rollout_max_depth = int(rollout_max_depth) if rollout_max_depth is not None else None
+
     print(f"[setup] Loading prompts: {data_cfg['path']}")
-    prompt_buf = PromptBuffer(data_cfg['path'], context_len)
+    prompt_buf = PromptBuffer(
+        data_cfg['path'],
+        context_len,
+        min_depth=rollout_min_depth,
+        max_depth=rollout_max_depth,
+    )
     print(f"[setup] Distillation prompts: {prompt_buf.N} records in {len(prompt_buf.lengths)} length groups")
+    print(f"[setup] Distillation depth filter: min={rollout_min_depth} max={rollout_max_depth}")
 
     print(f"[setup] Building student from {base_model_path}")
     student = build_model(model_cfg).to(device)

@@ -1,5 +1,5 @@
 # Training config: student model on-policy distillation (OPD).
-# Requires: log/student_sft/student_sft.pt and a trained teacher model.
+# Requires: log/student_pretrain/student_pretrain.pt and a trained teacher model.
 # Usage: python opd.py --config config/student_opd.yaml
 #
 # Config name = log subdirectory name (log/student_opd/).
