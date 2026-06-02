@@ -23,21 +23,26 @@ model:
   activation: gelu
 
 train:
-  base_model_path: log/student_sft/student_sft.pt
-  reference_model_path: log/student_sft/student_sft.pt
-  lr: 5.0e-5
+  base_model_path: log/student_pretrain/student_pretrain.pt
+  reference_model_path: log/student_pretrain/student_pretrain.pt   # KL penalty reference
+  lr: 3.0e-5
   lr_schedule: cosine
-  batch_size: 32
-  n_steps: 400
-  warmup_steps: 40
+  n_runs: 3                      # repeat GRPO with seed, seed+1, ...; each run writes log/student_grpo/run_xx/
+  batch_size: 32                  # prompts per step
+  n_steps: 1000
+  warmup_steps: 80
   weight_decay: 0.0
   grad_clip: 1.0
-  n_rollouts_per_prompt: 8
-  clip_eps: 0.2
-  kl_coeff: 0.05
-  reward_fn: interpreter
+  n_rollouts_per_prompt: 16       # G: larger group reduces GRPO advantage noise
+  clip_eps: 0.2                   # importance sampling clip epsilon
+  kl_coeff: 0.03                  # beta: lower KL allows more improvement from pretrain
+  rollout_min_depth: 3            # focus RL signal on harder prompts; depths 0-2 are already near-perfect
+  rollout_max_depth: 5
+  reward_fn: interpreter          # interpreter | partial_match
   rollout_temperature: 1.0
   loss_on_prompt: false
+  amp: true
+  amp_dtype: bf16
   seed: 42
   device: cuda
 
@@ -61,6 +66,6 @@ inference:
   temperature: 0.0
   top_p: 1.0
   max_new_tokens: 96
-  show_cot: false
+  show_cot: true
   show_raw: false
   device: cuda

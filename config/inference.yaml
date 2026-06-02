@@ -1,3 +1,0 @@
-# DEPRECATED: inference settings are now part of each training config (inference: block).
-# Use: python inference.py --config config/teacher_pretrain.yaml
-# This file is kept for git history only.
