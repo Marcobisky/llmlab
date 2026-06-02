@@ -8,7 +8,7 @@ data:
   split: teacher_train
   n_samples: 50000
   depth_range: [0, 5]
-  operand_len_range: [2, 5]       # slightly shorter than [2,8] to improve ctx=96 filter pass rate
+  operand_len_range: [1, 8]       # same range as pretrain; ctx=96 filter discards samples that are too long
   n_operands_range: [1, 3]
   ops_enabled: all
   check_fraction: 0.0             # no check samples (check data has no CoT trace)

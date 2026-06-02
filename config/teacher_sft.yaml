@@ -44,7 +44,7 @@ output:
 logging:
   log_every: 100                   # 5000/100 = 50 log points
   eval_batch_size: 256
-  eval_data_path: data/eval.jsonl
+  eval_data_path: data/eval_10k_depth5.jsonl
   n_traj_ckpt: 20
   ckpt_dtype: float16
   tmp_ckpt_dir: log/teacher_sft/checkpoint
