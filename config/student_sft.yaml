@@ -47,6 +47,7 @@ logging:
   eval_every: 500              # full eval every 500 steps -> ~10 eval points
   eval_batch_size: 256
   eval_data_path: data/eval_10k_depth5.jsonl
+  save_ckpt: false                # post-training reuses pretrain PCA basis; no checkpoints needed
   n_traj_ckpt: 30
   ckpt_dtype: float16
   tmp_ckpt_dir: log/student_sft/checkpoint

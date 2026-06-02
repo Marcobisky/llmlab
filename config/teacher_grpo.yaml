@@ -6,7 +6,7 @@
 # To start a new training run, create a NEW config file — do not reuse this one.
 
 data:
-  path: data/teacher_sft.jsonl    # only the prompt field is used for rollouts
+  path: data/expr_500k_depth5.jsonl    # only the prompt field is used for rollouts
 
 model:
   vocab_size: 34
@@ -23,8 +23,8 @@ model:
   activation: gelu
 
 train:
-  base_model_path: log/teacher_sft/teacher_sft.pt
-  reference_model_path: log/teacher_sft/teacher_sft.pt   # KL penalty reference
+  base_model_path: log/teacher_pretrain/teacher_pretrain.pt
+  reference_model_path: log/teacher_pretrain/teacher_pretrain.pt   # KL penalty reference
   lr: 5.0e-5
   lr_schedule: cosine
   batch_size: 32                  # prompts per step
@@ -50,6 +50,7 @@ logging:
   eval_every: 100              # full eval every 100 steps
   eval_batch_size: 256
   eval_data_path: data/eval_10k_depth5.jsonl
+  save_ckpt: false                # post-training reuses pretrain PCA basis; no checkpoints needed
   n_traj_ckpt: 30
   ckpt_dtype: float16
   tmp_ckpt_dir: log/teacher_grpo/checkpoint

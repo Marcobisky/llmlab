@@ -35,7 +35,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent))
 from lib.lang    import TOKEN2ID
 from lib.model   import build_model
-from lib.metrics import compute_metrics, save_landscape
+from lib.metrics import compute_metrics, save_landscape, get_flat_params
 
 PAD_ID = TOKEN2ID['[EOS]']   # padding token (labels use -100 mask)
 EOS_ID = TOKEN2ID['[EOS]']
@@ -255,6 +255,10 @@ def main(config_path: str):
     ckpt_dtype      = log_cfg.get('ckpt_dtype', 'float16')
     tmp_dir         = log_cfg['tmp_ckpt_dir']
     pca_basis_path  = log_cfg.get('pca_basis_path')   # optional: path to pca_basis.npz from an earlier stage
+    # save_ckpt: whether to save trajectory checkpoints during training.
+    # Only pretrain stages need this (to compute PCA basis). Post-training stages
+    # reuse the pretrain PCA directions and don't need to save their own checkpoints.
+    save_ckpt       = log_cfg.get('save_ckpt', False)
     log_dir         = out_cfg['log_dir']
     model_path      = out_cfg['model_path']
     # eval_every: how often to run the full (slow) eval: val_loss + greedy-decode task_acc.
@@ -353,8 +357,21 @@ def main(config_path: str):
 
     # per-interval timing accumulators (reset every log_every steps)
     t_train_s   = 0.0   # pure forward + backward + optimizer time
-    t_ckpt_s    = 0.0   # checkpoint save time
+    t_ckpt_s    = 0.0   # checkpoint save time (only when save_ckpt=True)
     n_ckpts_in_interval = 0
+
+    # Lightweight trajectory tracking for post-training stages (save_ckpt=False):
+    # d1/d2 are known up front from pca_basis_path, so we only need two dot products
+    # per traj step — theta_t @ d1 and theta_t @ d2 — instead of saving full weight files.
+    # At the end we subtract theta_star @ d1/d2 to get the delta projections.
+    _pca_d1: Optional[np.ndarray] = None
+    _pca_d2: Optional[np.ndarray] = None
+    _traj_proj1: List[float] = []   # theta_t @ d1 at each traj step
+    _traj_proj2: List[float] = []   # theta_t @ d2 at each traj step
+    if not save_ckpt and pca_basis_path and Path(pca_basis_path).exists():
+        _npz = np.load(pca_basis_path)
+        _pca_d1, _pca_d2 = _npz['d1'], _npz['d2']   # [P]
+        print(f"[setup] PCA basis loaded for lightweight trajectory tracking (no checkpoint files)")
 
     n_epoch_steps = max(1, buf.N // batch_size)
     print(f"\n{'='*60}")
@@ -362,7 +379,8 @@ def main(config_path: str):
     print(f"  data={buf.N}  steps/epoch≈{n_epoch_steps}  "
           f"total≈{n_steps/n_epoch_steps:.1f} epochs")
     print(f"  AMP={use_amp}  grad_clip={grad_clip}  lr={lr:.2e}")
-    print(f"  ckpt_interval={ckpt_interval}  log_every={log_every}  eval_every={eval_every}")
+    ckpt_mode = "full checkpoints" if save_ckpt else ("dot-product traj tracking" if _pca_d1 is not None else "no traj")
+    print(f"  ckpt_interval={ckpt_interval} ({ckpt_mode})  log_every={log_every}  eval_every={eval_every}")
     print(f"{'='*60}\n")
 
     for step in range(1, n_steps + 1):
@@ -404,11 +422,22 @@ def main(config_path: str):
             compile_note = " (incl. torch.compile JIT)" if train_cfg.get('compile', True) else ""
             print(f"[timing] First step: {t_train_s*1000:.0f}ms{compile_note}")
 
-        # ── save trajectory checkpoint ───────────────────────────────────────
+        # ── trajectory tracking ──────────────────────────────────────────────
         if step % ckpt_interval == 0 or step == 1:
-            elapsed_ckpt = save_tmp_ckpt(model, tmp_dir, step, ckpt_dtype)
-            t_ckpt_s += elapsed_ckpt
-            n_ckpts_in_interval += 1
+            if save_ckpt:
+                # full checkpoint: save weights to disk for PCA computation
+                elapsed_ckpt = save_tmp_ckpt(model, tmp_dir, step, ckpt_dtype)
+                t_ckpt_s += elapsed_ckpt
+                n_ckpts_in_interval += 1
+            elif _pca_d1 is not None:
+                # lightweight: just compute two dot products, no disk I/O
+                # GPU->CPU copy needed, same as checkpoint but skip disk write
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _raw = getattr(model, '_orig_mod', model)
+                _flat = get_flat_params(_raw)              # [P] float32 numpy
+                _traj_proj1.append(float(_flat @ _pca_d1))
+                _traj_proj2.append(float(_flat @ _pca_d2))
 
         # ── metrics logging ──────────────────────────────────────────────────
         if step % log_every == 0 or step == n_steps:
@@ -480,29 +509,44 @@ def main(config_path: str):
 
     metrics_file.close()
 
-    # wait for any in-flight background checkpoint write to finish
-    if _ckpt_thread is not None and _ckpt_thread.is_alive():
-        print("[timing] Waiting for background checkpoint write to finish...")
-        _ckpt_thread.join()
-
     # save final weights
     _t = time.time()
     raw_model = getattr(model, '_orig_mod', model)
     torch.save(raw_model.state_dict(), model_path)
     print(f"\n[timing] Final model saved: {model_path}  ({time.time()-_t:.2f}s)")
 
-    # loss landscape
+    # wait for any in-flight background checkpoint write to finish
+    if save_ckpt and _ckpt_thread is not None and _ckpt_thread.is_alive():
+        print("[timing] Waiting for background checkpoint write to finish...")
+        _ckpt_thread.join()
+
+    # Convert lightweight dot-product snapshots to trajectory delta coordinates.
+    # traj_proj stores theta_t @ d1/d2; subtract theta_star @ d1/d2 to get delta projections.
+    precomputed_traj = None
+    if _traj_proj1:
+        _flat_star = get_flat_params(raw_model)
+        precomputed_traj = (
+            np.array([p - float(_flat_star @ _pca_d1) for p in _traj_proj1], dtype=np.float32),
+            np.array([q - float(_flat_star @ _pca_d2) for q in _traj_proj2], dtype=np.float32),
+        )
+        print(f"[timing] Trajectory precomputed: {len(_traj_proj1)} points (no checkpoint files)")
+
+    # loss landscape: always attempted.
+    # - save_ckpt=True  (pretrain): loads checkpoint files, computes PCA, plots grid + trajectory.
+    # - save_ckpt=False (post-train): uses precomputed_traj (dot-product snapshots) for trajectory,
+    #   pca_basis_path for d1/d2 — no checkpoint files written or read.
     print("\n[timing] Computing loss landscape...")
     save_landscape(
-        model           = raw_model,
-        tmp_ckpt_dir    = tmp_dir,
-        eval_batch      = eval_batch,
-        device          = device,
-        log_dir         = log_dir,
-        grid_res        = log_cfg.get('grid_res', 31),
-        alpha_range     = tuple(log_cfg.get('landscape_alpha_range', [-1.0, 1.0])),
-        beta_range      = tuple(log_cfg.get('landscape_beta_range',  [-1.0, 1.0])),
-        pca_basis_path  = pca_basis_path,
+        model            = raw_model,
+        tmp_ckpt_dir     = tmp_dir,
+        eval_batch       = eval_batch,
+        device           = device,
+        log_dir          = log_dir,
+        grid_res         = log_cfg.get('grid_res', 31),
+        alpha_range      = tuple(log_cfg.get('landscape_alpha_range', [-1.0, 1.0])),
+        beta_range       = tuple(log_cfg.get('landscape_beta_range',  [-1.0, 1.0])),
+        pca_basis_path   = pca_basis_path,
+        precomputed_traj = precomputed_traj,
     )
 
     total_min = (time.time() - t_start) / 60

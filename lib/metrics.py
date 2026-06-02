@@ -266,7 +266,7 @@ def set_flat_params(model, flat: np.ndarray):
 
 def save_landscape(
     model,                          # final trained model (theta*)
-    tmp_ckpt_dir: str,              # directory of float16 .pt checkpoints (kept after training)
+    tmp_ckpt_dir: str,              # directory of float16 .pt checkpoints (pretrain only)
     eval_batch: Tuple[torch.Tensor, torch.Tensor],  # fixed eval batch
     device: str,
     log_dir: str,                   # where to save landscape.npz and pca_basis.npz
@@ -276,55 +276,65 @@ def save_landscape(
     loss_fn = None,                 # None -> CE; GRPO stages can pass custom loss
     pca_basis_path: Optional[str] = None,  # path to pca_basis.npz from an earlier stage;
                                            # if set, reuse those d1/d2 for a shared coordinate system
+    precomputed_traj: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+                                    # (traj_alpha [N], traj_beta [N]) pre-projected by caller.
+                                    # Used when save_ckpt=False: pretrain.py tracks dot-product
+                                    # snapshots during training instead of saving full checkpoints.
 ):
     """
     Compute and save the loss landscape for one training stage.
 
     PCA directions (d1, d2):
-      - If pca_basis_path is None (base stage, e.g. pretrain):
-          compute d1, d2 via SVD on the checkpoint deltas and save them to
-          log_dir/pca_basis.npz so downstream stages can reuse the same axes.
-      - If pca_basis_path points to an existing pca_basis.npz (downstream stages):
-          load d1, d2 from that file. The trajectory is projected onto the same
-          coordinate system, making landscapes from different stages directly comparable.
+      - If pca_basis_path is None (pretrain): compute d1, d2 via SVD on checkpoint
+        deltas and save to log_dir/pca_basis.npz for downstream stages.
+      - If pca_basis_path is set (post-training): load d1, d2 from that file so all
+        stages share the same coordinate system.
 
-    Steps:
-      1. Load all float16 checkpoints from tmp_ckpt_dir.
-      2. Obtain d1, d2 (compute or load, see above).
-      3. Project each checkpoint to (alpha, beta) relative to theta* -> trajectory.
-      4. Evaluate loss on theta* + alpha*d1 + beta*d2 grid -> Z [grid_res, grid_res].
-      5. Save log_dir/landscape.npz. Checkpoints are retained for further analysis.
+    Trajectory:
+      - save_ckpt=True  (pretrain): load checkpoint files from tmp_ckpt_dir, project
+        each delta onto (d1, d2), auto-range the grid around the trajectory.
+      - save_ckpt=False (post-training): caller passes precomputed_traj with dot-product
+        snapshots already projected; no checkpoint files needed.
+
+    Grid:
+      Always computed: loss at theta* + alpha*d1 + beta*d2 for each (alpha, beta) in grid.
     """
-    tmp_dir = Path(tmp_ckpt_dir)
+    tmp_dir    = Path(tmp_ckpt_dir)
     ckpt_files = sorted(tmp_dir.glob("*.pt"))
-    if not ckpt_files:
-        print(f"  [landscape] No checkpoints in {tmp_ckpt_dir}, skipping.")
-        return
+    has_ckpts  = bool(ckpt_files)
 
-    print(f"  [landscape] Loading {len(ckpt_files)} checkpoints...")
-    theta_star = get_flat_params(model)   # final parameters, shape [P]
+    theta_star = get_flat_params(model)   # final parameters [P]
     P = len(theta_star)
 
-    # Load all checkpoints as float32 flat vectors.
-    # Must go through load_state_dict -> get_flat_params to handle tied embeddings:
-    # state_dict has separate keys for tok_emb.weight and head.weight, but
-    # model.parameters() counts shared params only once — direct flattening
-    # of state.values() would mismatch dimensions.
-    thetas = []
-    for f in ckpt_files:
-        state = torch.load(f, map_location='cpu', weights_only=True)
-        state_f32 = {k: v.float() for k, v in state.items()}
-        model.load_state_dict(state_f32, strict=True)
-        thetas.append(get_flat_params(model))
+    # ── Require at least one of: checkpoints (to compute PCA) or pca_basis_path ──
+    has_pca_basis = pca_basis_path and Path(pca_basis_path).exists()
+    if not has_ckpts and not has_pca_basis:
+        print(f"  [landscape] No checkpoints in {tmp_ckpt_dir} and no pca_basis_path; skipping.")
+        return
 
-    # restore final parameters before we start modifying them for the grid
-    set_flat_params(model, theta_star)
-
-    # compute offsets relative to theta_star
-    deltas = np.stack([t - theta_star for t in thetas], axis=0)  # [N, P]
+    # ── Load trajectory checkpoints (optional) ───────────────────────────────
+    # Checkpoints are needed to: (a) compute PCA directions when pca_basis_path
+    # is absent; (b) plot the training trajectory on the landscape.
+    # When save_ckpt=False (post-training stages), neither is needed — the grid
+    # itself only requires theta*, d1, d2.
+    deltas: Optional[np.ndarray] = None
+    if has_ckpts:
+        print(f"  [landscape] Loading {len(ckpt_files)} checkpoints...")
+        # Must go through load_state_dict -> get_flat_params to handle tied embeddings:
+        # state_dict has separate keys for tok_emb.weight and head.weight, but
+        # model.parameters() counts shared params only once — direct flattening
+        # of state.values() would mismatch dimensions.
+        thetas = []
+        for f in ckpt_files:
+            state = torch.load(f, map_location='cpu', weights_only=True)
+            state_f32 = {k: v.float() for k, v in state.items()}
+            model.load_state_dict(state_f32, strict=True)
+            thetas.append(get_flat_params(model))
+        set_flat_params(model, theta_star)   # restore final params
+        deltas = np.stack([t - theta_star for t in thetas], axis=0)  # [N, P]
 
     # ── PCA directions ──────────────────────────────────────────────────────
-    if pca_basis_path and Path(pca_basis_path).exists():
+    if has_pca_basis:
         # reuse pre-computed basis from an earlier stage (e.g. pretrain)
         with np.load(pca_basis_path) as npf:
             d1 = npf['d1']   # [P]
@@ -336,7 +346,7 @@ def save_landscape(
                 "Only reuse pca_basis across stages with identical architecture."
             )
     else:
-        # compute fresh PCA via SVD and save for downstream stages
+        # compute fresh PCA via SVD on trajectory deltas; save for downstream stages
         print(f"  [landscape] Computing PCA ({deltas.shape[0]} x {P})...")
         _, _, Vt = np.linalg.svd(deltas, full_matrices=False)   # Vt: [min(N,P), P]
         d1 = Vt[0]                                                # [P], 1st principal direction
@@ -346,21 +356,34 @@ def save_landscape(
         np.savez(basis_out, d1=d1, d2=d2)
         print(f"  [landscape] PCA basis saved to {basis_out} (use as pca_basis_path in downstream configs)")
 
-    # ── Project trajectory ──────────────────────────────────────────────────
-    traj_alpha = deltas @ d1  # [N]
-    traj_beta  = deltas @ d2  # [N]
-
-    # auto-set grid range to cover the full trajectory + 15% margin
+    # ── Trajectory ───────────────────────────────────────────────────────────
     def _auto_range(vals: np.ndarray, pad_ratio: float = 0.15) -> Tuple[float, float]:
-        lo, hi  = float(vals.min()), float(vals.max())
-        span    = hi - lo if hi > lo else 1.0
-        pad     = span * pad_ratio
+        lo, hi = float(vals.min()), float(vals.max())
+        span   = hi - lo if hi > lo else 1.0
+        pad    = span * pad_ratio
         return lo - pad, hi + pad
 
-    alpha_range = _auto_range(traj_alpha)
-    beta_range  = _auto_range(traj_beta)
-    print(f"  [landscape] Trajectory alpha=[{traj_alpha.min():.2f},{traj_alpha.max():.2f}] "
-          f"beta=[{traj_beta.min():.2f},{traj_beta.max():.2f}]")
+    if precomputed_traj is not None:
+        # post-training path: caller tracked dot-product snapshots, no checkpoint files
+        traj_alpha, traj_beta = precomputed_traj   # [N], [N]
+        alpha_range = _auto_range(traj_alpha)
+        beta_range  = _auto_range(traj_beta)
+        print(f"  [landscape] Trajectory (precomputed, {len(traj_alpha)} points) "
+              f"alpha=[{traj_alpha.min():.2f},{traj_alpha.max():.2f}] "
+              f"beta=[{traj_beta.min():.2f},{traj_beta.max():.2f}]")
+    elif deltas is not None:
+        # pretrain path: project checkpoint deltas onto PCA directions
+        traj_alpha = deltas @ d1   # [N]
+        traj_beta  = deltas @ d2   # [N]
+        alpha_range = _auto_range(traj_alpha)
+        beta_range  = _auto_range(traj_beta)
+        print(f"  [landscape] Trajectory ({len(traj_alpha)} checkpoints) "
+              f"alpha=[{traj_alpha.min():.2f},{traj_alpha.max():.2f}] "
+              f"beta=[{traj_beta.min():.2f},{traj_beta.max():.2f}]")
+    else:
+        traj_alpha = np.empty(0, dtype=np.float32)
+        traj_beta  = np.empty(0, dtype=np.float32)
+        print(f"  [landscape] No trajectory; using config ranges alpha={alpha_range} beta={beta_range}")
     print(f"  [landscape] Grid range  alpha={alpha_range}  beta={beta_range}")
 
     # ── Grid loss computation ───────────────────────────────────────────────
@@ -393,16 +416,16 @@ def save_landscape(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         out_path,
-        alpha_grid = alpha_vals,     # [grid_res]
-        beta_grid  = beta_vals,      # [grid_res]
-        Z          = Z,              # [grid_res, grid_res]
-        traj_alpha = traj_alpha,     # [N]
-        traj_beta  = traj_beta,      # [N]
+        alpha_grid = alpha_vals,   # [grid_res]
+        beta_grid  = beta_vals,    # [grid_res]
+        Z          = Z,            # [grid_res, grid_res]
+        traj_alpha = traj_alpha,   # [N] or empty when save_ckpt=False
+        traj_beta  = traj_beta,    # [N] or empty when save_ckpt=False
     )
     print(f"  [landscape] Saved {out_path}")
 
-    # Delete tmp checkpoints: traj_alpha/beta are now in landscape.npz,
-    # so the .pt files are no longer needed for visualization.
-    for f in ckpt_files:
-        f.unlink()
-    print(f"  [landscape] Tmp checkpoints deleted ({len(ckpt_files)} files, {tmp_dir})")
+    # Delete tmp checkpoints: traj_alpha/beta are now in landscape.npz.
+    if has_ckpts:
+        for f in ckpt_files:
+            f.unlink()
+        print(f"  [landscape] Tmp checkpoints deleted ({len(ckpt_files)} files, {tmp_dir})")
