@@ -33,10 +33,11 @@ train:
   weight_decay: 0.0
   grad_clip: 1.0
   kl_direction: forward           # forward | reverse
+  prefix_source: dataset          # dataset | rollout; off-policy KD uses clean data prefixes
   temperature: 2.0                # soften teacher distribution for the small student
-  alpha_ce: 0.05                  # small hard-token anchor on teacher sampled paths
-  rollout_temperature: 0.0        # clean teacher prefix sampling; separate from KL temperature
-  filter_teacher_correct: true    # skip teacher rollouts whose final answer is wrong
+  alpha_ce: 0.1                   # clean hard-token anchor mixed with soft KL
+  rollout_temperature: 0.0        # only used when prefix_source=rollout
+  filter_teacher_correct: false   # only used when prefix_source=rollout
   rollout_min_depth: 0            # full-depth replay avoids shallow-skill forgetting
   rollout_max_depth: 5
   loss_on_prompt: false

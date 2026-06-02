@@ -114,6 +114,82 @@ class PromptBuffer:
         return prompt_ids, records
 
 
+class DatasetPrefixBuffer:
+    """
+    Clean-prefix sampler for off-policy KD.
+
+    It uses dataset target tokens as the visited prefix, while the loss remains
+    soft KL against the teacher distribution at each target-token position.
+    """
+    def __init__(
+        self,
+        jsonl_path: str,
+        context_len: int,
+        min_depth: int = 0,
+        max_depth: Optional[int] = None,
+    ):
+        groups: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)
+
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if '?' in rec.get('prompt', ''):
+                    continue
+                if 'expr' not in rec or 'result' not in rec:
+                    continue
+                depth = int(rec.get('depth', 0))
+                if depth < min_depth:
+                    continue
+                if max_depth is not None and depth > max_depth:
+                    continue
+
+                prompt_ids = tokenize_prompt(rec['prompt'])
+                target_ids = tokenize_prompt(rec['target'])
+                if not prompt_ids or not target_ids:
+                    continue
+                max_target_len = context_len - len(prompt_ids)
+                if max_target_len <= 0:
+                    continue
+                target_ids = target_ids[:max_target_len]
+                full_ids = prompt_ids + target_ids
+                groups[(len(prompt_ids), len(target_ids))].append({
+                    'full_ids': full_ids,
+                    'depth': depth,
+                })
+
+        if not groups:
+            raise ValueError(f"No clean KD prefixes found in {jsonl_path}")
+
+        self.groups = dict(groups)
+        self.keys = sorted(self.groups)
+        sizes = np.array([len(self.groups[k]) for k in self.keys], dtype=np.float64)
+        self.probs = sizes / sizes.sum()
+        self.N = int(sizes.sum())
+
+    def sample(self, batch_size: int, device: str) -> Tuple[torch.Tensor, int, torch.Tensor]:
+        """
+        Sample a same-shape clean-prefix batch.
+
+        full_ids:    [B=128, Lp+Lt=23]
+        prompt_len:  Lp=18
+        action_mask: [B=128, Lt=5]
+        """
+        key_idx = int(np.random.choice(len(self.keys), p=self.probs))
+        prompt_len, target_len = self.keys[key_idx]
+        group = self.groups[(prompt_len, target_len)]
+        idx = np.random.randint(0, len(group), size=batch_size)
+        full_ids = torch.tensor(
+            [group[i]['full_ids'] for i in idx],
+            dtype=torch.long,
+            device=device,
+        )
+        action_mask = torch.ones((batch_size, target_len), dtype=torch.bool, device=device)
+        return full_ids, prompt_len, action_mask
+
+
 def _infer_cfg_from_state_dict(state: Dict[str, torch.Tensor], fallback_cfg: Dict) -> Dict:
     """Infer enough architecture fields from a checkpoint to rebuild the model."""
     d_model = int(state['tok_emb.weight'].shape[1])
@@ -407,6 +483,7 @@ def run_distillation(config_path: str, mode: str):
     temperature = float(train_cfg.get('temperature', 1.0))
     alpha_ce = float(train_cfg.get('alpha_ce', 0.0))
     loss_on_prompt = bool(train_cfg.get('loss_on_prompt', False))
+    prefix_source = train_cfg.get('prefix_source', 'dataset' if mode == 'kd' else 'rollout')
     rollout_temperature = float(train_cfg.get('rollout_temperature', 1.0))
     filter_teacher_correct = bool(train_cfg.get('filter_teacher_correct', False))
     max_new_tokens = int(cfg.get('inference', {}).get('max_new_tokens', context_len))
@@ -446,6 +523,16 @@ def run_distillation(config_path: str, mode: str):
     )
     print(f"[setup] Distillation prompts: {prompt_buf.N} records in {len(prompt_buf.lengths)} length groups")
     print(f"[setup] Distillation depth filter: min={rollout_min_depth} max={rollout_max_depth}")
+
+    clean_buf: Optional[DatasetPrefixBuffer] = None
+    if prefix_source == 'dataset':
+        clean_buf = DatasetPrefixBuffer(
+            data_cfg['path'],
+            context_len,
+            min_depth=rollout_min_depth,
+            max_depth=rollout_max_depth,
+        )
+        print(f"[setup] Clean KD prefixes: {clean_buf.N} records in {len(clean_buf.keys)} shape groups")
 
     print(f"[setup] Building student from {base_model_path}")
     student = build_model(model_cfg).to(device)
@@ -514,6 +601,7 @@ def run_distillation(config_path: str, mode: str):
     print(f"\n{'=' * 60}")
     print(f"{stage_name}  n_steps={n_steps}  batch={batch_size}  prefix_owner={prefix_owner}  device={device}")
     print(f"  data={prompt_buf.N}  lr={lr:.2e}  kl_direction={kl_direction}  T={temperature:.2f}")
+    print(f"  prefix_source={prefix_source}")
     print(f"  rollout_temperature={rollout_temperature:.2f}")
     if mode == 'kd':
         print(f"  filter_teacher_correct={filter_teacher_correct}")
@@ -528,27 +616,33 @@ def run_distillation(config_path: str, mode: str):
             pg['lr'] = cur_lr
 
         t_step = time.time()
-        prompt_ids, records = prompt_buf.sample(batch_size, device)  # prompt_ids: [B=64, Lp]
-        rollout_model = teacher if prefix_owner == 'teacher' else student
-        sample_temp = rollout_temperature
-        full_ids, action_mask = sample_rollout_prefixes(
-            model=rollout_model,
-            prompt_ids=prompt_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=sample_temp,
-            device=device,
-            use_amp=use_amp,
-            amp_dtype=amp_dtype,
-        )
-        # full_ids: [B=64, Lp+Tc], action_mask: [B=64, Tc]
-        if mode == 'kd' and filter_teacher_correct and action_mask.numel() > 0:
-            completion_ids = full_ids[:, prompt_ids.shape[1]:].detach().cpu().tolist()
-            keep = [
-                extract_result(gen_ids) == str(rec.get('result'))
-                for gen_ids, rec in zip(completion_ids, records)
-            ]
-            keep_t = torch.tensor(keep, dtype=torch.bool, device=device)  # keep_t: [B=64]
-            if keep_t.any():
+        if prefix_source == 'dataset':
+            full_ids, prompt_len, action_mask = clean_buf.sample(batch_size, device)
+            # full_ids: [B=128, Lp+Lt], action_mask: [B=128, Lt]
+        else:
+            prompt_ids, records = prompt_buf.sample(batch_size, device)  # prompt_ids: [B=64, Lp]
+            prompt_len = prompt_ids.shape[1]
+            rollout_model = teacher if prefix_owner == 'teacher' else student
+            full_ids, action_mask = sample_rollout_prefixes(
+                model=rollout_model,
+                prompt_ids=prompt_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=rollout_temperature,
+                device=device,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+            )
+            # full_ids: [B=64, Lp+Tc], action_mask: [B=64, Tc]
+            if mode == 'kd' and filter_teacher_correct and action_mask.numel() > 0:
+                completion_ids = full_ids[:, prompt_len:].detach().cpu().tolist()
+                keep = [
+                    extract_result(gen_ids) == str(rec.get('result'))
+                    for gen_ids, rec in zip(completion_ids, records)
+                ]
+                keep_t = torch.tensor(keep, dtype=torch.bool, device=device)  # keep_t: [B=64]
+                if not keep_t.any():
+                    t_train_s += time.time() - t_step
+                    continue
                 full_ids = full_ids[keep_t]          # full_ids: [B_keep, Lp+Tc]
                 action_mask = action_mask[keep_t]    # action_mask: [B_keep, Tc]
         student.train()
@@ -557,7 +651,7 @@ def run_distillation(config_path: str, mode: str):
             student=student,
             teacher=teacher,
             full_ids=full_ids,
-            prompt_len=prompt_ids.shape[1],
+            prompt_len=prompt_len,
             action_mask=action_mask,
             kl_direction=kl_direction,
             temperature=temperature,
