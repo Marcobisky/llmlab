@@ -25,7 +25,7 @@ model:
 train:
   base_model_path: log/student_pretrain/student_pretrain.pt
   teacher_model_path: log/teacher_grpo/run_00/teacher_grpo_run_00.pt   # distillation source
-  lr: 5.0e-5
+  lr: 3.0e-5
   lr_schedule: cosine
   batch_size: 128
   n_steps: 3000
@@ -34,8 +34,10 @@ train:
   grad_clip: 1.0
   kl_direction: forward           # forward | reverse
   temperature: 2.0                # soften teacher distribution for the small student
-  alpha_ce: 0.1                   # mix teacher-sampled token CE with soft KL
-  rollout_min_depth: 3            # focus KD on hard prompts instead of already-solved shallow cases
+  alpha_ce: 0.05                  # small hard-token anchor on teacher sampled paths
+  rollout_temperature: 0.0        # clean teacher prefix sampling; separate from KL temperature
+  filter_teacher_correct: true    # skip teacher rollouts whose final answer is wrong
+  rollout_min_depth: 0            # full-depth replay avoids shallow-skill forgetting
   rollout_max_depth: 5
   loss_on_prompt: false
   seed: 42

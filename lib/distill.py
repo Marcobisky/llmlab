@@ -27,11 +27,27 @@ from lib.model import build_model
 from pretrain import get_lr, make_eval_batch
 
 EOS_ID = TOKEN2ID['[EOS]']
+ID2TOK = {v: k for k, v in TOKEN2ID.items()}
 
 
 def tokenize_prompt(prompt: str) -> List[int]:
     """Convert a space-separated prompt string into token IDs."""
     return [TOKEN2ID[t] for t in prompt.split() if t in TOKEN2ID]
+
+
+def extract_result(gen_ids: List[int]) -> str:
+    """Extract final answer tokens after the last '=' and before EOS."""
+    toks = [ID2TOK.get(i, '?') for i in gen_ids]
+    last_eq = max((i for i, t in enumerate(toks) if t == '='), default=-1)
+    if last_eq < 0:
+        return ''
+    parts = []
+    for t in toks[last_eq + 1:]:
+        if t == '[EOS]':
+            break
+        if t.isdigit():
+            parts.append(t)
+    return ''.join(parts)
 
 
 class PromptBuffer:
@@ -391,7 +407,8 @@ def run_distillation(config_path: str, mode: str):
     temperature = float(train_cfg.get('temperature', 1.0))
     alpha_ce = float(train_cfg.get('alpha_ce', 0.0))
     loss_on_prompt = bool(train_cfg.get('loss_on_prompt', False))
-    rollout_temperature = float(train_cfg.get('rollout_temperature', temperature))
+    rollout_temperature = float(train_cfg.get('rollout_temperature', 1.0))
+    filter_teacher_correct = bool(train_cfg.get('filter_teacher_correct', False))
     max_new_tokens = int(cfg.get('inference', {}).get('max_new_tokens', context_len))
     log_every = int(log_cfg['log_every'])
     eval_every = int(log_cfg.get('eval_every', log_every))
@@ -497,6 +514,9 @@ def run_distillation(config_path: str, mode: str):
     print(f"\n{'=' * 60}")
     print(f"{stage_name}  n_steps={n_steps}  batch={batch_size}  prefix_owner={prefix_owner}  device={device}")
     print(f"  data={prompt_buf.N}  lr={lr:.2e}  kl_direction={kl_direction}  T={temperature:.2f}")
+    print(f"  rollout_temperature={rollout_temperature:.2f}")
+    if mode == 'kd':
+        print(f"  filter_teacher_correct={filter_teacher_correct}")
     print(f"  loss_on_prompt={loss_on_prompt}  alpha_ce={alpha_ce:.2f}  AMP={use_amp}")
     print(f"  log_every={log_every}  eval_every={eval_every}")
     print(f"{'=' * 60}\n")
@@ -508,9 +528,9 @@ def run_distillation(config_path: str, mode: str):
             pg['lr'] = cur_lr
 
         t_step = time.time()
-        prompt_ids, _ = prompt_buf.sample(batch_size, device)  # prompt_ids: [B=64, Lp]
+        prompt_ids, records = prompt_buf.sample(batch_size, device)  # prompt_ids: [B=64, Lp]
         rollout_model = teacher if prefix_owner == 'teacher' else student
-        sample_temp = temperature if prefix_owner == 'teacher' else rollout_temperature
+        sample_temp = rollout_temperature
         full_ids, action_mask = sample_rollout_prefixes(
             model=rollout_model,
             prompt_ids=prompt_ids,
@@ -521,6 +541,16 @@ def run_distillation(config_path: str, mode: str):
             amp_dtype=amp_dtype,
         )
         # full_ids: [B=64, Lp+Tc], action_mask: [B=64, Tc]
+        if mode == 'kd' and filter_teacher_correct and action_mask.numel() > 0:
+            completion_ids = full_ids[:, prompt_ids.shape[1]:].detach().cpu().tolist()
+            keep = [
+                extract_result(gen_ids) == str(rec.get('result'))
+                for gen_ids, rec in zip(completion_ids, records)
+            ]
+            keep_t = torch.tensor(keep, dtype=torch.bool, device=device)  # keep_t: [B=64]
+            if keep_t.any():
+                full_ids = full_ids[keep_t]          # full_ids: [B_keep, Lp+Tc]
+                action_mask = action_mask[keep_t]    # action_mask: [B_keep, Tc]
         student.train()
 
         loss, _ = distill_loss(
@@ -568,7 +598,7 @@ def run_distillation(config_path: str, mode: str):
                 prefix_owner='teacher',
                 batch_size=kl_metric_bs,
                 max_new_tokens=max_new_tokens,
-                sample_temperature=temperature,
+                sample_temperature=rollout_temperature,
                 kl_direction='forward',
                 temperature=temperature,
                 loss_on_prompt=loss_on_prompt,
