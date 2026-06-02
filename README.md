@@ -155,6 +155,7 @@ python data.py --config config/expr_500k_depth5.yaml         # teacher pretrain 
 python data.py --config config/cot_50k_depth5.yaml           # teacher SFT data
 python data.py --config config/expr_500k_depth5_student.yaml # student pretrain data
 python data.py --config config/stmt_100k_depth5.yaml         # student SFT data
+
 python data.py --config config/eval_10k_depth5.yaml          # eval data
 
 # 2. Teacher pipeline

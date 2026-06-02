@@ -158,13 +158,16 @@ def get_lr(step: int, n_steps: int, lr: float, warmup_steps: int,
 # Temporary checkpoint (for landscape computation)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_tmp_ckpt(model: nn.Module, tmp_dir: str, step: int, dtype: str = 'float16'):
-    """Save current parameters as float16 to tmp_dir/<step>.pt (used by landscape)."""
+def save_tmp_ckpt(model: nn.Module, tmp_dir: str, step: int, dtype: str = 'float16') -> float:
+    """Save current parameters as float16 to tmp_dir/<step>.pt (used by landscape).
+    Returns elapsed seconds."""
+    t0 = time.time()
     Path(tmp_dir).mkdir(parents=True, exist_ok=True)
     raw = getattr(model, '_orig_mod', model)  # unwrap torch.compile if needed
     state = {k: v.half() if dtype == 'float16' else v.clone()
              for k, v in raw.state_dict().items()}
     torch.save(state, Path(tmp_dir) / f"{step:06d}.pt")
+    return time.time() - t0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,24 +227,31 @@ def main(config_path: str):
     for d in [log_dir, tmp_dir, str(Path(model_path).parent)]:
         Path(d).mkdir(parents=True, exist_ok=True)
 
-    # build model
-    print(f"Building model (context_len={context_len})...")
+    # ── build model ──────────────────────────────────────────────────────────
+    _t = time.time()
+    print(f"[setup] Building model (context_len={context_len})...")
     model = build_model(model_cfg).to(device)
+    print(f"[setup] Model built in {time.time()-_t:.2f}s")
 
     base_path = train_cfg.get('base_model_path')
     if base_path and Path(base_path).exists():
-        print(f"Loading base model: {base_path}")
+        _t = time.time()
+        print(f"[setup] Loading base model: {base_path}")
         model.load_state_dict(
             torch.load(base_path, map_location=device, weights_only=True)
         )
+        print(f"[setup] Base model loaded in {time.time()-_t:.2f}s")
 
     # torch.compile: ~30-50% additional speedup for small models
     if train_cfg.get('compile', True) and hasattr(torch, 'compile'):
-        print("  torch.compile() (first step will be slow)...")
-        # reduce-overhead: minimizes Python/CUDA kernel launch overhead
+        _t = time.time()
+        print("[setup] torch.compile() wrapping model...")
         model = torch.compile(model, mode="reduce-overhead")
+        # NOTE: actual kernel compilation is deferred to the first forward pass
+        print(f"[setup] torch.compile() wrap done in {time.time()-_t:.2f}s "
+              f"(first step will be slow due to JIT compilation)")
 
-    # GPU data preloading
+    # ── GPU data preloading ──────────────────────────────────────────────────
     data_path = data_cfg['path']
     # mode='sft': prompt labels are -100; loss computed only on target tokens.
     # Both pretrain and SFT use this mode — the difference is in the data:
@@ -249,8 +259,14 @@ def main(config_path: str):
     #   SFT: only one type (e.g. CoT), specializes generation format
     buf = GPUDataBuffer(data_path, context_len, mode='sft', device=device)
 
-    # eval data
+    if device == 'cuda':
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved  = torch.cuda.memory_reserved() / 1e9
+        print(f"[setup] GPU memory after data load: {allocated:.2f}GB allocated / {reserved:.2f}GB reserved")
+
+    # ── eval data ────────────────────────────────────────────────────────────
     eval_data_path = log_cfg.get('eval_data_path', '')
+    _t = time.time()
     eval_records: List[Dict] = []
     if Path(eval_data_path).exists():
         with open(eval_data_path) as f:
@@ -258,7 +274,8 @@ def main(config_path: str):
                 line = line.strip()
                 if line:
                     eval_records.append(json.loads(line))
-        print(f"Eval data: {len(eval_records)} records  ({eval_data_path})")
+        print(f"[setup] Eval data: {len(eval_records)} records ({eval_data_path}), "
+              f"loaded in {time.time()-_t:.2f}s")
     else:
         with open(data_path) as f:
             for line in f:
@@ -267,9 +284,12 @@ def main(config_path: str):
                     eval_records.append(json.loads(line))
                 if len(eval_records) >= eval_bs:
                     break
-        print(f"Warning: eval file not found, borrowing {len(eval_records)} records from train set")
+        print(f"[setup] Warning: eval file not found, borrowing {len(eval_records)} records "
+              f"from train set in {time.time()-_t:.2f}s")
 
+    _t = time.time()
     eval_batch = make_eval_batch(eval_records, context_len, eval_bs, device, mode='sft')
+    print(f"[setup] Eval batch ({eval_bs} records) built in {time.time()-_t:.2f}s")
     # eval_batch: (inp [B, C-1], lbl [B, C-1]), fixed throughout training
 
     # optimizer
@@ -290,12 +310,18 @@ def main(config_path: str):
     t_start    = time.time()
     t_interval = t_start
 
+    # per-interval timing accumulators (reset every log_every steps)
+    t_train_s   = 0.0   # pure forward + backward + optimizer time
+    t_ckpt_s    = 0.0   # checkpoint save time
+    n_ckpts_in_interval = 0
+
     n_epoch_steps = max(1, buf.N // batch_size)
     print(f"\n{'='*60}")
     print(f"Pretrain  n_steps={n_steps}  batch={batch_size}  device={device}")
     print(f"  data={buf.N}  steps/epoch≈{n_epoch_steps}  "
           f"total≈{n_steps/n_epoch_steps:.1f} epochs")
     print(f"  AMP={use_amp}  grad_clip={grad_clip}  lr={lr:.2e}")
+    print(f"  ckpt_interval={ckpt_interval}  log_every={log_every}")
     print(f"{'='*60}\n")
 
     for step in range(1, n_steps + 1):
@@ -305,7 +331,8 @@ def main(config_path: str):
         for pg in optimizer.param_groups:
             pg['lr'] = cur_lr
 
-        # sample + forward (AMP)
+        # ── forward + backward + optimizer (pure training time) ──────────────
+        t_step = time.time()
         inp_ids, labels = buf.sample(batch_size)
         # inp_ids: [B=batch_size, T=C-1]
         # labels:  [B, T], -100 positions ignored by CE
@@ -329,20 +356,28 @@ def main(config_path: str):
             grad_norm_t = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
         # avoid .item() in hot path; CPU-GPU sync deferred to log steps
+        t_train_s += time.time() - t_step
 
-        # save trajectory checkpoint
+        # first step: report compile JIT overhead
+        if step == 1:
+            compile_note = " (incl. torch.compile JIT)" if train_cfg.get('compile', True) else ""
+            print(f"[timing] First step: {t_train_s*1000:.0f}ms{compile_note}")
+
+        # ── save trajectory checkpoint ───────────────────────────────────────
         if step % ckpt_interval == 0 or step == 1:
-            save_tmp_ckpt(model, tmp_dir, step, ckpt_dtype)
+            elapsed_ckpt = save_tmp_ckpt(model, tmp_dir, step, ckpt_dtype)
+            t_ckpt_s += elapsed_ckpt
+            n_ckpts_in_interval += 1
 
-        # metrics logging
+        # ── metrics logging ──────────────────────────────────────────────────
         if step % log_every == 0 or step == n_steps:
-            now         = time.time()
-            interval_s  = now - t_interval
-            t_interval  = now
-            tps         = log_every * batch_size * (context_len - 1) / interval_s
+            now        = time.time()
+            interval_s = now - t_interval
+            t_interval = now
 
             grad_norm_val = grad_norm_t.item() if grad_norm_t is not None else 0.0
 
+            t_eval = time.time()
             raw_model = getattr(model, '_orig_mod', model)
             m, prev_flat = compute_metrics(
                 model            = raw_model,
@@ -354,25 +389,39 @@ def main(config_path: str):
                 grad_norm        = grad_norm_val,
                 prev_flat_params = prev_flat,
             )
+            t_eval_s = time.time() - t_eval
+
             metrics_file.write(json.dumps(m) + '\n')
             metrics_file.flush()
+
+            # tps based on pure training time only (excluding ckpt and eval overhead)
+            tps = log_every * batch_size * (context_len - 1) / max(t_train_s, 1e-6)
 
             print(
                 f"step {step:6d}/{n_steps} | lr={cur_lr:.2e} | "
                 f"loss={m['train_loss']:.4f} | val={m['val_loss']:.4f} | "
                 f"acc={m['task_acc']:.3f} | gnorm={grad_norm_val:.2f} | "
-                f"{tps/1000:.1f}k tok/s"
+                f"{tps/1000:.1f}k tok/s | "
+                f"[train={t_train_s*1000/log_every:.1f}ms/step "
+                f"ckpt={t_ckpt_s*1000:.0f}ms×{n_ckpts_in_interval} "
+                f"eval={t_eval_s*1000:.0f}ms]"
             )
+
+            # reset interval accumulators
+            t_train_s  = 0.0
+            t_ckpt_s   = 0.0
+            n_ckpts_in_interval = 0
 
     metrics_file.close()
 
     # save final weights
+    _t = time.time()
     raw_model = getattr(model, '_orig_mod', model)
     torch.save(raw_model.state_dict(), model_path)
-    print(f"\nModel saved: {model_path}")
+    print(f"\n[timing] Final model saved: {model_path}  ({time.time()-_t:.2f}s)")
 
     # loss landscape
-    print("\nComputing loss landscape...")
+    print("\n[timing] Computing loss landscape...")
     save_landscape(
         model           = raw_model,
         tmp_ckpt_dir    = tmp_dir,
