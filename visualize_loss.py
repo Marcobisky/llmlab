@@ -1,9 +1,8 @@
 """
 visualize_loss.py — Reads log/*/metrics.jsonl and generates loss/accuracy plots.
 
-All plots are saved to log/<config_name>/fig/ (derived from the --config argument).
-The script scans all log/* subdirectories so multi-stage comparison plots include
-every available stage.
+Single config  → plots only that stage, saved to log/<stage>/fig/
+Multiple configs → overlays all specified stages for comparison, saved to log/img/
 
 Plots:
     A: train_loss / val_loss curves (all stages overlaid)
@@ -12,7 +11,8 @@ Plots:
     D: exposure bias (kl_student_prefix - kl_teacher_prefix, KD/OPD stages)
 
 Usage:
-    python visualize_loss.py --config config/teacher_pretrain.yaml
+    python visualize_loss.py --config config/teacher_sft.yaml
+    python visualize_loss.py --config config/teacher_pretrain.yaml config/teacher_sft.yaml
 """
 import argparse
 import json
@@ -47,21 +47,16 @@ COLORS = {
 }
 
 
-def load_all_metrics(log_root: str = 'log') -> Dict[str, List[Dict]]:
+def load_metrics(stages: List[str], log_root: str = 'log') -> Dict[str, List[Dict]]:
     """
-    Scan log/*/metrics.jsonl and group by stage name.
+    Load metrics.jsonl for each stage name in `stages`.
     Returns {stage_name: [row_dict, ...]}.
     """
     data = {}
-    log_path = Path(log_root)
-    if not log_path.exists():
-        return data
-
-    for stage_dir in sorted(log_path.iterdir()):
-        if not stage_dir.is_dir():
-            continue
-        mpath = stage_dir / 'metrics.jsonl'
+    for stage in stages:
+        mpath = Path(log_root) / stage / 'metrics.jsonl'
         if not mpath.exists():
+            print(f"  Warning: {mpath} not found, skipping.")
             continue
         rows = []
         with open(mpath) as f:
@@ -70,7 +65,7 @@ def load_all_metrics(log_root: str = 'log') -> Dict[str, List[Dict]]:
                 if line:
                     rows.append(json.loads(line))
         if rows:
-            data[stage_dir.name] = rows
+            data[stage] = rows
     return data
 
 
@@ -273,26 +268,37 @@ def plot_exposure_bias(data: Dict, out_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description='Loss / accuracy visualizer')
-    parser.add_argument('--config', required=True,
-                        help='Training config yaml; determines output fig dir (log/<name>/fig/)')
+    parser.add_argument('--config', required=True, nargs='+',
+                        help='One or more training config yamls. '
+                             'Single: plots that stage to log/<stage>/fig/. '
+                             'Multiple: comparison plot to log/img/.')
     args = parser.parse_args()
 
     os.chdir(Path(__file__).parent)
 
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    # Derive stage names from each config's output.log_dir
+    stages = []
+    for config_path in args.config:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        stages.append(Path(cfg['output']['log_dir']).name)
 
-    log_dir = cfg['output']['log_dir']
-    out_dir = Path(log_dir) / 'fig'
+    # Output directory: per-stage fig/ for single, shared log/img/ for comparison
+    if len(args.config) == 1:
+        with open(args.config[0]) as f:
+            cfg = yaml.safe_load(f)
+        out_dir = Path(cfg['output']['log_dir']) / 'fig'
+    else:
+        out_dir = Path('log/img')
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Scanning log/*/metrics.jsonl ...")
-    data = load_all_metrics('log')
+    print(f"Loading metrics for: {stages}")
+    data = load_metrics(stages)
     if not data:
         print("No metrics.jsonl files found, exiting.")
         return
 
-    print(f"Found {len(data)} stage(s): {list(data.keys())}\n")
+    print(f"Loaded {len(data)} stage(s): {list(data.keys())}\n")
 
     plot_loss_curves(data, out_dir)
     plot_reward_curves(data, out_dir)

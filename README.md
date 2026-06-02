@@ -176,6 +176,8 @@ python visualize_loss.py   --config config/teacher_pretrain.yaml
 python visualize_weight.py --config config/teacher_pretrain.yaml
 python visualize_llm.py    --config config/teacher_pretrain.yaml rs1234
 
+python visualize_weight.py --config config/teacher_pretrain.yaml config/teacher_sft.yaml # 对比 pretrain 和 SFT 的
+
 # 5. Inference REPL
 python inference.py --config config/teacher_pretrain.yaml
 python inference.py --config config/teacher_sft.yaml --model path/to/override.pt

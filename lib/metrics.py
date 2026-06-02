@@ -400,4 +400,9 @@ def save_landscape(
         traj_beta  = traj_beta,      # [N]
     )
     print(f"  [landscape] Saved {out_path}")
-    print(f"  [landscape] Checkpoints retained in {tmp_dir}")
+
+    # Delete tmp checkpoints: traj_alpha/beta are now in landscape.npz,
+    # so the .pt files are no longer needed for visualization.
+    for f in ckpt_files:
+        f.unlink()
+    print(f"  [landscape] Tmp checkpoints deleted ({len(ckpt_files)} files, {tmp_dir})")
