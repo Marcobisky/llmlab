@@ -1,19 +1,18 @@
 # Data generation config: 500k mixed expr/check samples (no CoT), depth 0-5, student split.
 # Usage: python data.py --config config/expr_500k_depth5_student.yaml
 # Output: data/student_pretrain.jsonl
-# Note: student has smaller capacity; CoT traces omitted to focus on direct generation.
 
 data:
-  path: data/student_pretrain.jsonl
+  path: data/expr_200k_depth4.jsonl
   split: student_train
-  n_samples: 500000
-  depth_range: [0, 5]
-  operand_len_range: [2, 8]
+  n_samples: 200000
+  depth_range: [0, 4]
+  operand_len_range: [1, 6]
   n_operands_range: [1, 3]
   ops_enabled: all
   check_fraction: 0.15
   verdict_ratio: [5, 3, 2]
-  cot_fraction: 0.0               # no CoT for student pretrain
+  cot_fraction: 0.1
   vw_corruption: swap
   noise_rate: 0.0
   seed: 44
