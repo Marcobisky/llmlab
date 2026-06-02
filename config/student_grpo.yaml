@@ -6,7 +6,7 @@
 # To start a new training run, create a NEW config file — do not reuse this one.
 
 data:
-  path: data/student_sft.jsonl
+  path: data/expr_500k_depth5.jsonl
 
 model:
   vocab_size: 34
