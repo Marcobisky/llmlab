@@ -161,6 +161,7 @@ python data.py --config config/eval_10k_depth5.yaml          # eval data
 # 2. Teacher pipeline
 python pretrain.py --config config/teacher_pretrain.yaml
 python sft.py      --config config/teacher_sft.yaml
+python sft_lora.py --config config/teacher_sft_lora.yaml     # 可选，SFT 的 LoRA 版本
 python grpo.py     --config config/teacher_grpo.yaml         # -> teacher_final
 
 # 3. Student pipeline

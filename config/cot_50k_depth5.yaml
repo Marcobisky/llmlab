@@ -1,10 +1,10 @@
 # Data generation config: 50k CoT-only samples, depth 0-5, teacher split.
 # Usage: python data.py --config config/cot_50k_depth5.yaml
-# Output: data/teacher_sft.jsonl
+# Output: data/cot_50k_depth5.jsonl
 # Note: CoT samples are 3-5x longer than plain stmt; 50k is sufficient for SFT.
 
 data:
-  path: data/teacher_sft.jsonl
+  path: data/cot_50k_depth5.jsonl
   split: teacher_train
   n_samples: 50000
   depth_range: [0, 5]

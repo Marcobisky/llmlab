@@ -1,0 +1,70 @@
+# Training config: teacher model SFT with LoRA (PEFT).
+# Identical dataset and n_steps as teacher_sft.yaml for a fair comparison.
+# Usage: python sft_lora.py --config config/teacher_sft_lora.yaml
+
+data:
+  path: data/cot_50k_depth5.jsonl
+
+model:
+  vocab_size: 34
+  context_len: 96
+  d_model: 192
+  n_layers: 6
+  n_heads: 6
+  d_head: 32
+  d_ffn: 768
+  dropout: 0.0
+  tie_embedding: true
+  pos_embedding: learned
+  norm_type: pre_ln
+  activation: gelu
+
+lora:
+  rank: 8                           # LoRA rank r; trainable params = r*(d_in+d_out) per layer
+  alpha: 16.0                       # scaling factor; effective scale = alpha/rank = 2.0
+  targets:                          # which Linear layers to adapt (matched as name suffix)
+    - attn.qkv                      #   blocks.*.attn.qkv  [192->576]  6144 params each
+    - attn.proj                     #   blocks.*.attn.proj [192->192]  3072 params each
+  dropout: 0.0                      # dropout on LoRA input (0 = disabled, same as full SFT)
+  # trainable param count:
+  #   qkv:  6 layers x r*(192+576) = 6 x 8x768  = 36,864
+  #   proj: 6 layers x r*(192+192) = 6 x 8x384  = 18,432
+  #   total: 55,296  (~2.1% of 2.67M base params)
+
+train:
+  base_model_path: log/teacher_pretrain/teacher_pretrain.pt
+  lr: 1.0e-4                        # same as full SFT (LoRA often tolerates higher LR but keep equal for fair comparison)
+  lr_schedule: cosine
+  batch_size: 256
+  n_steps: 5000                     # identical to teacher_sft.yaml
+  warmup_steps: 200
+  weight_decay: 0.1
+  grad_clip: 1.0
+  amp: true
+  amp_dtype: bf16
+  compile: true
+  seed: 42
+  device: cuda
+
+output:
+  model_path: log/teacher_sft_lora/teacher_sft_lora.pt   # saved as merged weights (same format as full SFT)
+  log_dir: log/teacher_sft_lora
+
+logging:
+  log_every: 100
+  eval_every: 200
+  eval_batch_size: 256
+  eval_data_path: data/eval_10k_depth5.jsonl
+  n_traj_ckpt: 20
+  ckpt_dtype: float16
+  tmp_ckpt_dir: log/teacher_sft_lora/checkpoint
+  grid_res: 31
+  pca_basis_path: log/teacher_pretrain/pca_basis.npz
+
+inference:
+  temperature: 0.0
+  top_p: 1.0
+  max_new_tokens: 96
+  show_cot: true
+  show_raw: false
+  device: cuda
