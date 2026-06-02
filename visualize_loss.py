@@ -47,6 +47,8 @@ COLORS = {
     'student_grpo':     '#8c564b',
 }
 
+RUN_METRICS: Dict[str, List[List[Dict]]] = {}
+
 
 def load_metrics(stages: List[str], log_root: str = 'log') -> Dict[str, List[Dict]]:
     """
@@ -59,6 +61,7 @@ def load_metrics(stages: List[str], log_root: str = 'log') -> Dict[str, List[Dic
         run_paths = sorted((Path(log_root) / stage).glob('run_*/metrics.jsonl'))
         if run_paths:
             run_rows = [_read_metrics_jsonl(p) for p in run_paths]
+            RUN_METRICS[stage] = run_rows
             rows = _aggregate_metric_runs(run_rows)
             print(f"  {stage}: aggregated {len(run_paths)} run metrics file(s)")
         elif mpath.exists():
@@ -138,6 +141,41 @@ def _col(rows: List[Dict], key: str):
     return np.array(steps), np.array(vals)
 
 
+def _plot_scalar_with_runs(ax, stage: str, rows: List[Dict], key: str,
+                           color: str, linestyle: str = '-'):
+    """Plot individual runs, mean line, and mean ± std band for one scalar metric."""
+    run_rows = RUN_METRICS.get(stage)
+    if run_rows:
+        for i, rr in enumerate(run_rows):
+            s, v = _col(rr, key)
+            if len(s):
+                ax.plot(s, v, color=color, alpha=0.18, linewidth=0.8,
+                        linestyle=linestyle,
+                        label=f'{stage} runs' if i == 0 else None)
+
+    steps, mean = _col(rows, key)
+    if not len(steps):
+        return
+    label = f'{stage} mean' if run_rows else stage
+    ax.plot(steps, mean, label=label, color=color, linestyle=linestyle)
+
+    steps_std, std = _col(rows, f'{key}_std')
+    if len(steps_std):
+        std_map = dict(zip(steps_std.tolist(), std.tolist()))
+        aligned_std = np.array([std_map.get(int(s), np.nan) for s in steps])
+        ok = ~np.isnan(aligned_std)
+        if ok.any():
+            ax.fill_between(
+                steps[ok],
+                mean[ok] - aligned_std[ok],
+                mean[ok] + aligned_std[ok],
+                color=color,
+                alpha=0.12,
+                linewidth=0,
+                label=f'{stage} ±1 std',
+            )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Plot A: Loss curves
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,13 +188,8 @@ def plot_loss_curves(data: Dict, out_dir: Path, tag: str = ''):
         rows  = data[stage]
         color = _color(stage)
 
-        steps_t, train_loss = _col(rows, 'train_loss')
-        steps_v, val_loss   = _col(rows, 'val_loss')
-
-        if len(steps_t):
-            ax_train.plot(steps_t, train_loss, label=stage, color=color)
-        if len(steps_v):
-            ax_val.plot(steps_v, val_loss, label=stage, color=color, linestyle='--')
+        _plot_scalar_with_runs(ax_train, stage, rows, 'train_loss', color, linestyle='-')
+        _plot_scalar_with_runs(ax_val, stage, rows, 'val_loss', color, linestyle='--')
 
     for ax, title in [(ax_train, 'Train Loss'), (ax_val, 'Val Loss')]:
         ax.set_xlabel('Step')
@@ -183,7 +216,7 @@ def plot_reward_curves(data: Dict, out_dir: Path, tag: str = ''):
     for stage in _sorted_stages(data):
         steps, rewards = _col(data[stage], 'mean_reward')
         if len(steps):
-            ax.plot(steps, rewards, label=stage, color=_color(stage))
+            _plot_scalar_with_runs(ax, stage, data[stage], 'mean_reward', _color(stage))
             has_data = True
 
     if not has_data:
@@ -223,19 +256,34 @@ def plot_acc_by_depth(data: Dict, out_dir: Path, tag: str = ''):
 
     for i, stage in enumerate(stages):
         rows = data[stage]
-        accs = None
-        for row in reversed(rows):
-            v = row.get('task_acc_by_depth')
-            if v is not None:
-                accs = v
-                break
-        if accs is None:
+        final_accs = []
+        if stage in RUN_METRICS:
+            for rr in RUN_METRICS[stage]:
+                for row in reversed(rr):
+                    v = row.get('task_acc_by_depth')
+                    if v is not None:
+                        final_accs.append((list(v) + [0.0] * 6)[:6])
+                        break
+        else:
+            for row in reversed(rows):
+                v = row.get('task_acc_by_depth')
+                if v is not None:
+                    final_accs.append((list(v) + [0.0] * 6)[:6])
+                    break
+
+        if not final_accs:
             continue
 
-        accs_padded = (list(accs) + [0.0] * max(0, 6 - len(accs)))[:6]
+        acc_arr = np.array(final_accs, dtype=float)
+        accs_padded = acc_arr.mean(axis=0)
+        acc_std = acc_arr.std(axis=0) if len(final_accs) > 1 else None
         offset = (i - n / 2 + 0.5) * width
         ax.bar(x + offset, accs_padded, width=width,
                label=stage, color=_color(stage), alpha=0.85)
+        if acc_std is not None:
+            ax.errorbar(x + offset, accs_padded, yerr=acc_std,
+                        fmt='none', ecolor='k', elinewidth=0.8,
+                        capsize=2, alpha=0.7)
 
     ax.set_xlabel('Depth')
     ax.set_ylabel('Accuracy')

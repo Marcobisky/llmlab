@@ -6,7 +6,7 @@
 # To start a new training run, create a NEW config file — do not reuse this one.
 
 data:
-  path: data/student_sft.jsonl    # teacher rolls out on these prompts
+  path: data/expr_500k_depth5.jsonl    # teacher rolls out on these prompts
 
 model:
   vocab_size: 34
@@ -23,7 +23,7 @@ model:
   activation: gelu
 
 train:
-  base_model_path: log/student_sft/student_sft.pt
+  base_model_path: log/student_pretrain/student_pretrain.pt
   teacher_model_path: log/teacher_grpo/teacher_grpo.pt   # distillation source
   lr: 1.0e-4
   lr_schedule: cosine
@@ -59,6 +59,6 @@ inference:
   temperature: 0.0
   top_p: 1.0
   max_new_tokens: 96
-  show_cot: false
+  show_cot: true
   show_raw: false
   device: cuda

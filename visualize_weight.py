@@ -84,15 +84,38 @@ def plot_one_landscape(ax, ld: dict, stage: str):
     ax.contour(B, A, Z_plot, levels=levels[::4], colors='k', linewidths=0.4, alpha=0.5)
     plt.colorbar(cf, ax=ax, label='log(1+L-Lmin)', shrink=0.82, pad=0.02)
 
-    if len(ta) > 0:
-        ax.plot(tb, ta, 'o-', color='royalblue', markersize=3,
-                linewidth=1.0, label='Trajectory', zorder=3)
-        ax.scatter(tb[0], ta[0], color='cyan',  s=50, zorder=4, label='Start')
+    runs = _trajectory_runs(ld)
+    if runs:
+        if len(runs) == 1:
+            ta, tb = runs[0]
+            ax.plot(tb, ta, 'o-', color='royalblue', markersize=3,
+                    linewidth=1.0, label='Trajectory', zorder=3)
+            ax.scatter(tb[0], ta[0], color='cyan', s=50, zorder=4, label='Start')
+        else:
+            for i, (ta_run, tb_run) in enumerate(runs):
+                ax.plot(tb_run, ta_run, '-', color='royalblue', linewidth=0.8,
+                        alpha=0.18, zorder=2, label='Runs' if i == 0 else None)
+            mean_a, mean_b, std_a, std_b = _mean_std_trajectories(runs)
+            ax.plot(mean_b, mean_a, 'o-', color='royalblue', markersize=3,
+                    linewidth=1.5, label='Mean trajectory', zorder=4)
+            every = max(1, len(mean_a) // 12)
+            ax.errorbar(mean_b[::every], mean_a[::every],
+                        xerr=std_b[::every], yerr=std_a[::every],
+                        fmt='none', ecolor='royalblue', elinewidth=0.8,
+                        alpha=0.65, capsize=2, zorder=3, label='±1 std')
+            ax.scatter(mean_b[0], mean_a[0], color='cyan', s=50,
+                       zorder=5, label='Mean start')
     ax.scatter([0], [0], color='red', s=80, marker='*', zorder=5, label='theta* (end)')
 
     # auto axis limits covering both grid and trajectory
-    all_b = np.concatenate([bg, tb]) if len(tb) else bg
-    all_a = np.concatenate([ag, ta]) if len(ta) else ag
+    if runs:
+        run_a = np.concatenate([r[0] for r in runs])
+        run_b = np.concatenate([r[1] for r in runs])
+        all_b = np.concatenate([bg, run_b])
+        all_a = np.concatenate([ag, run_a])
+    else:
+        all_b = bg
+        all_a = ag
     def _lim(vals, margin=0.05):
         lo, hi = vals.min(), vals.max()
         pad = (hi - lo) * margin if hi > lo else 1.0

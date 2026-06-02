@@ -2,9 +2,12 @@
 __pycache__/
 tmp/
 data/
+model/
+backup/
 
 # Agent related
 AGENTS.md
 
 log/*
 !log/teacher_pretrain/
+!log/student_pretrain/
