@@ -24,7 +24,7 @@ model:
 
 train:
   base_model_path: log/student_pretrain/student_pretrain.pt
-  teacher_model_path: log/teacher_grpo/teacher_grpo.pt   # distillation source
+  teacher_model_path: log/teacher_grpo/run_00/teacher_grpo_run_00.pt   # distillation source
   lr: 1.0e-4
   lr_schedule: cosine
   batch_size: 64

@@ -11,3 +11,12 @@ AGENTS.md
 log/*
 !log/teacher_pretrain/
 !log/student_pretrain/
+
+# 让 Git 进入这些子目录
+!log/teacher_grpo/
+log/teacher_grpo/*
+!log/teacher_grpo/run_00/
+log/teacher_grpo/run_00/*
+
+# 最终取消忽略这个特定的文件
+!log/teacher_grpo/run_00/teacher_grpo_run_00.pt
