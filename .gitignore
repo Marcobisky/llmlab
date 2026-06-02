@@ -3,3 +3,6 @@ __pycache__/
 tmp/
 data/
 log/
+
+# Agent related
+AGENTS.md

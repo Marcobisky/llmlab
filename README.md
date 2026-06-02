@@ -148,6 +148,8 @@ VERDICT  := 'vc' | 'vw' | 'gw'
 ### 4.1 完整工作流
 
 ```bash
+# Install dependencies
+python -m pip install -r requirements.txt
 # 1. 生成数据集（必须先于训练）
 python data.py --config config/expr_500k_depth5.yaml         # teacher pretrain data
 python data.py --config config/cot_50k_depth5.yaml           # teacher SFT data
