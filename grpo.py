@@ -370,6 +370,10 @@ def main(config_path: str):
             pca_d1 = npz['d1']
             pca_d2 = npz['d2']
         print("[setup] PCA basis loaded for lightweight trajectory tracking")
+        flat_init = get_flat_params(model)
+        traj_proj1.append(float(flat_init @ pca_d1))
+        traj_proj2.append(float(flat_init @ pca_d2))
+        print("[setup] Initial GRPO point recorded in shared PCA coordinates")
 
     metrics_path = Path(log_dir) / "metrics.jsonl"
     metrics_file = open(metrics_path, 'w')

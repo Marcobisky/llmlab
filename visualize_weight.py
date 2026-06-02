@@ -111,37 +111,41 @@ def plot_connected_trajectories(landscapes: Dict, stages: List[str], out_dir: Pa
     """
     Single plot showing training trajectories of all stages end-to-end.
 
-    Coordinate system: last stage's theta* = origin (0, 0).
+    Coordinate system: first stage's theta* = origin (0, 0).
     All stages share the same PCA directions d1, d2 (pretrain anchors the basis;
     downstream stages reuse it), so trajectories live in the same vector space
     and can be stitched together with a coordinate offset.
 
-    Offset derivation for stage k (in the reference frame of stage N-1):
-        The first checkpoint of stage k+1 is saved very early in training, when
-        the model has barely moved from its init point = theta*_k.  Therefore:
-            traj_{k+1}[0] ≈ (theta*_k - theta*_{k+1}) · (d1, d2)
-        Accumulating from the last stage back to the first gives each stage's
-        origin offset in the shared frame.
+    Offset derivation in the first stage's final frame:
+        traj_i is stored relative to theta*_i:
+            traj_i[t] = (theta_i[t] - theta*_i) · (d1, d2)
+        If stage i starts from theta*_{i-1}, then its first trajectory point
+        should coincide with the previous stage endpoint.  Therefore:
+            offset_i = offset_{i-1} - traj_i[0]
+        and shifted_traj_i = traj_i + offset_i.
 
-    stages: in chronological order (earliest first), matching command-line order.
+    stages: in chronological order (earliest first).
     """
     # Palette: one distinct color per stage
     PALETTE = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
                '#8c564b', '#e377c2', '#bcbd22']
 
-    # ── compute cumulative offsets (from last stage to first) ─────────────────
+    # ── compute cumulative offsets from first stage final to later stages ─────
     n = len(stages)
-    off_a = [0.0] * n   # alpha offset for each stage in the reference frame
-    off_b = [0.0] * n   # beta  offset
-    for i in range(n - 2, -1, -1):
-        next_ld   = landscapes[stages[i + 1]]
-        # first checkpoint of next stage ≈ theta*_current stage
-        # its traj coords are relative to theta*_{i+1}, so add accumulated offset
-        off_a[i]  = float(next_ld['traj_alpha'][0]) + off_a[i + 1]
-        off_b[i]  = float(next_ld['traj_beta'][0])  + off_b[i + 1]
+    off_a = [0.0] * n   # alpha offset for each stage in the first-stage frame
+    off_b = [0.0] * n   # beta offset
+    for i in range(1, n):
+        ld = landscapes[stages[i]]
+        if len(ld['traj_alpha']) == 0:
+            off_a[i] = off_a[i - 1]
+            off_b[i] = off_b[i - 1]
+            continue
+        # Align this stage's start with the previous stage endpoint.
+        off_a[i] = off_a[i - 1] - float(ld['traj_alpha'][0])
+        off_b[i] = off_b[i - 1] - float(ld['traj_beta'][0])
 
     # ── collect all shifted coordinates for axis scaling ─────────────────────
-    all_alpha, all_beta = [0.0], [0.0]   # always include reference origin (0,0)
+    all_alpha, all_beta = [0.0], [0.0]   # first stage theta* origin
     for i, stage in enumerate(stages):
         ld = landscapes[stage]
         all_alpha.extend((ld['traj_alpha'] + off_a[i]).tolist())
@@ -174,10 +178,10 @@ def plot_connected_trajectories(landscapes: Dict, stages: List[str], out_dir: Pa
                    edgecolors='k', linewidths=0.5, zorder=6,
                    label=f'{stage} θ*')
 
-    # mark the global reference origin = last stage's theta*
+    # mark the global reference origin = first stage's theta*
     ax.scatter([0], [0], color='red', s=180, marker='*',
                edgecolors='k', linewidths=0.8, zorder=7,
-               label=f'{stages[-1]} θ* (origin)')
+               label=f'{stages[0]} θ* (origin)')
     ax.axhline(0, color='k', linewidth=0.5, alpha=0.25, linestyle='--')
     ax.axvline(0, color='k', linewidth=0.5, alpha=0.25, linestyle='--')
 
@@ -187,7 +191,7 @@ def plot_connected_trajectories(landscapes: Dict, stages: List[str], out_dir: Pa
     ax.set_ylabel('alpha (PC1)', fontsize=11)
     ax.set_title(
         'Training Trajectories — End-to-End\n'
-        '(Shared PCA basis; (0,0) = final θ*)',
+        f'(Shared PCA basis; (0,0) = {stages[0]} θ*)',
         fontsize=11
     )
     ax.legend(fontsize=8, loc='best', framealpha=0.85)
@@ -233,6 +237,13 @@ def plot_all_landscapes(landscapes: Dict, out_dir: Path, log_root: str = 'log'):
     print(f"  Landscape plot saved: {out}")
 
 
+def sort_stages_chronologically(stages: List[str]) -> List[str]:
+    """Sort requested stage names by the canonical training order."""
+    known = [s for s in STAGE_ORDER if s in stages]
+    unknown = [s for s in stages if s not in STAGE_ORDER]
+    return known + unknown
+
+
 def main():
     parser = argparse.ArgumentParser(description='Loss landscape visualizer')
     parser.add_argument('--config', required=True, nargs='+',
@@ -259,6 +270,8 @@ def main():
         out_dir = Path('log/img')
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    stages = sort_stages_chronologically(stages)
+
     print(f"Loading landscapes for: {stages}")
     landscapes = load_landscapes(stages)
     if not landscapes:
@@ -270,7 +283,8 @@ def main():
         plot_all_landscapes(landscapes, out_dir, log_root='log')
     else:
         # Multi-stage: connected trajectory in shared PCA coords (no landscape contour)
-        plot_connected_trajectories(landscapes, stages, out_dir)
+        loaded_stages = [s for s in stages if s in landscapes]
+        plot_connected_trajectories(landscapes, loaded_stages, out_dir)
     print(f"\nAll plots saved to {out_dir}")
 
 

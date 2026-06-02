@@ -372,6 +372,11 @@ def main(config_path: str):
         _npz = np.load(pca_basis_path)
         _pca_d1, _pca_d2 = _npz['d1'], _npz['d2']   # [P]
         print(f"[setup] PCA basis loaded for lightweight trajectory tracking (no checkpoint files)")
+        _raw_init = getattr(model, '_orig_mod', model)
+        _flat_init = get_flat_params(_raw_init)
+        _traj_proj1.append(float(_flat_init @ _pca_d1))
+        _traj_proj2.append(float(_flat_init @ _pca_d2))
+        print(f"[setup] Initial point recorded in shared PCA coordinates")
 
     n_epoch_steps = max(1, buf.N // batch_size)
     print(f"\n{'='*60}")

@@ -177,6 +177,7 @@ python visualize_weight.py --config config/teacher_pretrain.yaml
 python visualize_llm.py    --config config/teacher_pretrain.yaml rs1234
 
 python visualize_weight.py --config config/teacher_pretrain.yaml config/teacher_sft.yaml # 对比 pretrain 和 SFT 的
+python visualize_weight.py --config config/teacher_grpo.yaml config/teacher_pretrain.yaml # 自动按 pretrain -> GRPO 画 trajectory
 
 # 5. Inference REPL
 python inference.py --config config/teacher_pretrain.yaml
@@ -226,6 +227,8 @@ advantages                        # advantages: [R=256, 1]
 ```
 
 日志字段中 `mean_reward` 是 verifier 平均 reward，`kl_to_ref` 是当前 policy 相对 reference 的 token KL；`val_loss` 和 `task_acc` 仍复用统一评估集的 CE 与 greedy decode 正确率。
+
+trajectory / landscape 图由 `visualize_weight.py` 读取 `landscape.npz` 生成；多 config 输入会自动按训练顺序排序，所以命令行里先写 `teacher_grpo` 或先写 `teacher_pretrain` 都会按 `teacher_pretrain -> teacher_grpo` 拼接。`visualize_loss.py` 只读取 `metrics.jsonl`，不画权重轨迹。
 
 ---
 
