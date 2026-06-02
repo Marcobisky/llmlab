@@ -10,6 +10,7 @@ Usage:
     python grpo.py --config config/student_grpo.yaml
 """
 import argparse
+import copy
 import json
 import os
 import sys
@@ -82,7 +83,13 @@ class PromptBuffer:
     Records are grouped by prompt length so each sampled batch can be stacked
     without padding inside the prompt.
     """
-    def __init__(self, jsonl_path: str, context_len: int):
+    def __init__(
+        self,
+        jsonl_path: str,
+        context_len: int,
+        min_depth: int = 0,
+        max_depth: Optional[int] = None,
+    ):
         groups: Dict[int, List[Dict]] = defaultdict(list)
 
         with open(jsonl_path) as f:
@@ -95,13 +102,18 @@ class PromptBuffer:
                     continue
                 if 'expr' not in rec or 'result' not in rec or rec['result'] is None:
                     continue
+                depth = int(rec.get('depth', 0))
+                if depth < min_depth:
+                    continue
+                if max_depth is not None and depth > max_depth:
+                    continue
                 prompt_ids = tokenize_prompt(rec['prompt'])
                 if 0 < len(prompt_ids) < context_len:
                     groups[len(prompt_ids)].append({
                         'prompt_ids': prompt_ids,
                         'expr': rec['expr'],
                         'result': rec['result'],
-                        'depth': rec.get('depth', 0),
+                        'depth': depth,
                     })
 
         if not groups:
@@ -266,6 +278,36 @@ def main(config_path: str):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
+    train_cfg = cfg['train']
+    n_runs = int(train_cfg.get('n_runs', 1))
+    if n_runs > 1:
+        base_log_dir = Path(cfg['output']['log_dir'])
+        base_model_path = Path(cfg['output']['model_path'])
+        base_tmp_dir = Path(cfg['logging']['tmp_ckpt_dir'])
+        base_seed = int(train_cfg.get('seed', 42))
+        base_log_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"[multi-run] GRPO n_runs={n_runs}; outputs under {base_log_dir}/run_xx/")
+        for run_idx in range(n_runs):
+            run_name = f"run_{run_idx:02d}"
+            run_log_dir = base_log_dir / run_name
+            run_cfg = copy.deepcopy(cfg)
+            run_cfg['train']['n_runs'] = 1
+            run_cfg['train']['seed'] = base_seed + run_idx
+            run_cfg['output']['log_dir'] = str(run_log_dir)
+            run_cfg['output']['model_path'] = str(run_log_dir / f"{base_model_path.stem}_{run_name}{base_model_path.suffix}")
+            run_cfg['logging']['tmp_ckpt_dir'] = str(run_log_dir / base_tmp_dir.name)
+
+            run_cfg_path = base_log_dir / f"{run_name}.yaml"
+            with open(run_cfg_path, 'w') as f:
+                yaml.safe_dump(run_cfg, f, sort_keys=False)
+
+            print(f"\n[multi-run] Starting {run_name}/{n_runs - 1:02d} seed={base_seed + run_idx}")
+            main(str(run_cfg_path))
+
+        print(f"\n[multi-run] Complete. Re-run visualize_weight.py to plot mean/std trajectories.")
+        return
+
     data_cfg = cfg['data']
     model_cfg = cfg['model']
     train_cfg = cfg['train']
@@ -322,9 +364,19 @@ def main(config_path: str):
     if not ref_model_path or not Path(ref_model_path).exists():
         raise FileNotFoundError(f"reference_model_path not found: {ref_model_path}")
 
+    rollout_min_depth = int(train_cfg.get('rollout_min_depth', 0))
+    rollout_max_depth = train_cfg.get('rollout_max_depth')
+    rollout_max_depth = int(rollout_max_depth) if rollout_max_depth is not None else None
+
     print(f"[setup] Loading rollout prompts: {data_cfg['path']}")
-    prompt_buf = PromptBuffer(data_cfg['path'], context_len)
+    prompt_buf = PromptBuffer(
+        data_cfg['path'],
+        context_len,
+        min_depth=rollout_min_depth,
+        max_depth=rollout_max_depth,
+    )
     print(f"[setup] Rollout prompts: {prompt_buf.N} records in {len(prompt_buf.lengths)} length groups")
+    print(f"[setup] Rollout depth filter: min={rollout_min_depth} max={rollout_max_depth}")
 
     print(f"[setup] Building policy model from {base_model_path}")
     model = build_model(model_cfg).to(device)

@@ -199,16 +199,19 @@ python inference.py --config config/teacher_sft.yaml --model path/to/override.pt
 train:
   base_model_path: log/teacher_pretrain/teacher_pretrain.pt
   reference_model_path: log/teacher_pretrain/teacher_pretrain.pt
-  n_rollouts_per_prompt: 8
+  n_runs: 3
+  n_rollouts_per_prompt: 16
+  rollout_min_depth: 3
+  rollout_max_depth: 5
   clip_eps: 0.2
-  kl_coeff: 0.05
+  kl_coeff: 0.03
 ```
 
 teacher GRPO 的 policy warm-start 和 KL reference 都使用 pretrain 后的模型，不依赖 `teacher_sft.pt`。
 
 训练循环：
 
-1. 从 `data.path` 读取 rollout prompts，只保留没有 `?` 的表达式求值样本；`stmt` 和 `cot` 样本都可用，因为它们的 prompt 都是 `[BOS] EXPR`。
+1. 从 `data.path` 读取 rollout prompts，只保留没有 `?` 的表达式求值样本；`stmt` 和 `cot` 样本都可用，因为它们的 prompt 都是 `[BOS] EXPR`。`rollout_min_depth/max_depth` 可把 RL 信号集中到更难的组合深度上。
 2. 每步采样 `B` 个同长度 prompt，并对每个 prompt 采样 `G` 个 completion，得到 `R = B * G` 条 rollout。
 3. 从 completion 中取最后一个 `=` 后、`[EOS]` 前的数字串作为答案；答案等于解释器 `result` 时 reward = 1，否则 reward = 0。`reward_fn: partial_match` 会给正确前缀一个很小的 shaped reward。
 4. 对每个 prompt 的 `G` 个 reward 做组内标准化，作为 GRPO advantage。
@@ -228,7 +231,9 @@ advantages                        # advantages: [R=256, 1]
 
 日志字段中 `mean_reward` 是 verifier 平均 reward，`kl_to_ref` 是当前 policy 相对 reference 的 token KL；`val_loss` 和 `task_acc` 仍复用统一评估集的 CE 与 greedy decode 正确率。
 
-trajectory / landscape 图由 `visualize_weight.py` 读取 `landscape.npz` 生成；多 config 输入会自动按训练顺序排序，所以命令行里先写 `teacher_grpo` 或先写 `teacher_pretrain` 都会按 `teacher_pretrain -> teacher_grpo` 拼接。`visualize_loss.py` 只读取 `metrics.jsonl`，不画权重轨迹。
+当 `n_runs > 1` 时，`grpo.py` 会依次写入 `log/<stage>/run_00/`、`run_01/` ...；`visualize_weight.py` 会自动读取这些 run，画单 run 淡线、trajectory 均线和 ±1 std。
+
+trajectory / landscape 图由 `visualize_weight.py` 读取 `landscape.npz` 生成；多 config 输入会自动按训练顺序排序，所以命令行里先写 `teacher_grpo` 或先写 `teacher_pretrain` 都会按 `teacher_pretrain -> teacher_grpo` 拼接。`visualize_loss.py` 只读取 `metrics.jsonl`，不画权重轨迹。多 config 输出文件会带配置名后缀，例如 `trajectory_comparison__teacher_pretrain__teacher_grpo.png`，避免 `/log/img` 中不同组合互相覆盖。
 
 ---
 

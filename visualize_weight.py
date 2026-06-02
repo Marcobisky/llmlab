@@ -30,16 +30,34 @@ STAGE_ORDER = [
 ]
 
 
+def _load_npz_dict(npz_path: Path) -> dict:
+    """Load one .npz file into a plain dict."""
+    with np.load(npz_path) as d:
+        return {k: d[k] for k in d.files}
+
+
 def load_landscapes(stages: list, log_root: str = 'log') -> Dict[str, dict]:
-    """Load landscape.npz for each stage name. Returns {stage: {alpha_grid, beta_grid, Z, traj_*}}."""
+    """Load landscape.npz and optional run_*/landscape.npz files for each stage."""
     result = {}
     for stage in stages:
-        npz_path = Path(log_root) / stage / 'landscape.npz'
-        if not npz_path.exists():
-            print(f"  Warning: {npz_path} not found, skipping.")
+        stage_dir = Path(log_root) / stage
+        npz_path = stage_dir / 'landscape.npz'
+        run_paths = sorted(stage_dir.glob('run_*/landscape.npz'))
+
+        runs = [_load_npz_dict(p) for p in run_paths]
+        if npz_path.exists():
+            result[stage] = _load_npz_dict(npz_path)
+        elif runs:
+            # Use the first run for fields like grids/Z; trajectory plotting will
+            # use the full runs list.
+            result[stage] = dict(runs[0])
+        else:
+            print(f"  Warning: {npz_path} not found and no run_*/landscape.npz files, skipping.")
             continue
-        with np.load(npz_path) as d:
-            result[stage] = {k: d[k] for k in d.files}
+
+        if runs:
+            result[stage]['runs'] = runs
+            print(f"  {stage}: loaded {len(runs)} run trajectory file(s)")
     return result
 
 
@@ -107,7 +125,34 @@ def _shared_basis_note(landscapes: Dict, log_root: str = 'log') -> str:
     return f'  |  Shared PCA basis anchored at: {", ".join(base_stages)}'
 
 
-def plot_connected_trajectories(landscapes: Dict, stages: List[str], out_dir: Path):
+def _trajectory_runs(ld: dict) -> List[tuple]:
+    """Return a list of (traj_alpha, traj_beta) arrays for one stage."""
+    if ld.get('runs'):
+        return [(r['traj_alpha'], r['traj_beta']) for r in ld['runs']
+                if len(r['traj_alpha']) and len(r['traj_beta'])]
+    if len(ld['traj_alpha']) and len(ld['traj_beta']):
+        return [(ld['traj_alpha'], ld['traj_beta'])]
+    return []
+
+
+def _mean_std_trajectories(runs: List[tuple]) -> tuple:
+    """
+    Stack multiple trajectories to their common prefix length.
+
+    Returns mean_alpha, mean_beta, std_alpha, std_beta, each [T].
+    """
+    T = min(len(a) for a, _ in runs)
+    alpha = np.stack([a[:T] for a, _ in runs], axis=0)
+    beta = np.stack([b[:T] for _, b in runs], axis=0)
+    return alpha.mean(0), beta.mean(0), alpha.std(0), beta.std(0)
+
+
+def plot_connected_trajectories(
+    landscapes: Dict,
+    stages: List[str],
+    out_dir: Path,
+    tag: str = '',
+):
     """
     Single plot showing training trajectories of all stages end-to-end.
 
@@ -135,21 +180,23 @@ def plot_connected_trajectories(landscapes: Dict, stages: List[str], out_dir: Pa
     off_a = [0.0] * n   # alpha offset for each stage in the first-stage frame
     off_b = [0.0] * n   # beta offset
     for i in range(1, n):
-        ld = landscapes[stages[i]]
-        if len(ld['traj_alpha']) == 0:
+        runs = _trajectory_runs(landscapes[stages[i]])
+        if not runs:
             off_a[i] = off_a[i - 1]
             off_b[i] = off_b[i - 1]
             continue
+        start_a = float(np.mean([a[0] for a, _ in runs]))
+        start_b = float(np.mean([b[0] for _, b in runs]))
         # Align this stage's start with the previous stage endpoint.
-        off_a[i] = off_a[i - 1] - float(ld['traj_alpha'][0])
-        off_b[i] = off_b[i - 1] - float(ld['traj_beta'][0])
+        off_a[i] = off_a[i - 1] - start_a
+        off_b[i] = off_b[i - 1] - start_b
 
     # ── collect all shifted coordinates for axis scaling ─────────────────────
     all_alpha, all_beta = [0.0], [0.0]   # first stage theta* origin
     for i, stage in enumerate(stages):
-        ld = landscapes[stage]
-        all_alpha.extend((ld['traj_alpha'] + off_a[i]).tolist())
-        all_beta.extend( (ld['traj_beta']  + off_b[i]).tolist())
+        for ta, tb in _trajectory_runs(landscapes[stage]):
+            all_alpha.extend((ta + off_a[i]).tolist())
+            all_beta.extend((tb + off_b[i]).tolist())
         all_alpha.append(off_a[i])   # theta*_stage endpoint
         all_beta.append( off_b[i])
 
@@ -162,21 +209,41 @@ def plot_connected_trajectories(landscapes: Dict, stages: List[str], out_dir: Pa
     fig, ax = plt.subplots(figsize=(8, 7))
 
     for i, stage in enumerate(stages):
-        ld    = landscapes[stage]
-        ta    = ld['traj_alpha'] + off_a[i]   # shifted alpha trajectory  [N]
-        tb    = ld['traj_beta']  + off_b[i]   # shifted beta  trajectory  [N]
+        runs = _trajectory_runs(landscapes[stage])
+        if not runs:
+            continue
         color = PALETTE[i % len(PALETTE)]
 
-        # trajectory line + dots
-        ax.plot(tb, ta, 'o-', color=color, markersize=3, linewidth=1.4,
-                label=stage, zorder=3, alpha=0.9)
-        # first checkpoint (≈ start of this stage's training)
-        ax.scatter(tb[0], ta[0], color=color, s=55, marker='o',
-                   edgecolors='white', linewidths=0.8, zorder=5)
-        # theta*_stage endpoint (origin of this stage's own coord system)
+        if len(runs) == 1:
+            ta = runs[0][0] + off_a[i]   # shifted alpha trajectory [N]
+            tb = runs[0][1] + off_b[i]   # shifted beta trajectory [N]
+            ax.plot(tb, ta, 'o-', color=color, markersize=3, linewidth=1.4,
+                    label=stage, zorder=3, alpha=0.9)
+            ax.scatter(tb[0], ta[0], color=color, s=55, marker='o',
+                       edgecolors='white', linewidths=0.8, zorder=5)
+        else:
+            shifted_runs = [(a + off_a[i], b + off_b[i]) for a, b in runs]
+            for run_idx, (ta_run, tb_run) in enumerate(shifted_runs):
+                ax.plot(tb_run, ta_run, '-', color=color, linewidth=0.8,
+                        alpha=0.18, zorder=2,
+                        label=f'{stage} runs' if run_idx == 0 else None)
+
+            mean_a, mean_b, std_a, std_b = _mean_std_trajectories(shifted_runs)
+            ax.plot(mean_b, mean_a, 'o-', color=color, markersize=3.5,
+                    linewidth=1.8, label=f'{stage} mean', zorder=4)
+            every = max(1, len(mean_a) // 12)
+            ax.errorbar(mean_b[::every], mean_a[::every],
+                        xerr=std_b[::every], yerr=std_a[::every],
+                        fmt='none', ecolor=color, elinewidth=0.9,
+                        alpha=0.65, capsize=2, zorder=3,
+                        label=f'{stage} ±1 std')
+            ax.scatter(mean_b[0], mean_a[0], color=color, s=55, marker='o',
+                       edgecolors='white', linewidths=0.8, zorder=5)
+
+        # theta*_stage endpoint, or mean endpoint when multiple runs are present.
         ax.scatter(off_b[i], off_a[i], color=color, s=120, marker='*',
                    edgecolors='k', linewidths=0.5, zorder=6,
-                   label=f'{stage} θ*')
+                   label=f'{stage} θ*' if len(runs) == 1 else f'{stage} mean θ*')
 
     # mark the global reference origin = first stage's theta*
     ax.scatter([0], [0], color='red', s=180, marker='*',
@@ -198,10 +265,59 @@ def plot_connected_trajectories(landscapes: Dict, stages: List[str], out_dir: Pa
     ax.grid(True, alpha=0.2)
 
     fig.tight_layout()
-    out = out_dir / 'trajectory_comparison.png'
+    out = out_dir / f"trajectory_comparison{tag}.png"
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"  Trajectory comparison plot saved: {out}")
+
+    if len(stages) > 1:
+        zoom_stage = stages[-1]
+        zoom_runs = _trajectory_runs(landscapes[zoom_stage])
+        if zoom_runs:
+            color = PALETTE[(len(stages) - 1) % len(PALETTE)]
+            shifted_runs = [(a + off_a[-1], b + off_b[-1]) for a, b in zoom_runs]
+            fig_z, ax_z = plt.subplots(figsize=(7, 5))
+            zoom_alpha, zoom_beta = [], []
+
+            if len(shifted_runs) == 1:
+                ta, tb = shifted_runs[0]
+                ax_z.plot(tb, ta, 'o-', color=color, markersize=3,
+                          linewidth=1.5, label=zoom_stage)
+                zoom_alpha.extend(ta.tolist())
+                zoom_beta.extend(tb.tolist())
+            else:
+                for run_idx, (ta_run, tb_run) in enumerate(shifted_runs):
+                    ax_z.plot(tb_run, ta_run, '-', color=color, linewidth=0.8,
+                              alpha=0.18, label=f'{zoom_stage} runs' if run_idx == 0 else None)
+                    zoom_alpha.extend(ta_run.tolist())
+                    zoom_beta.extend(tb_run.tolist())
+                mean_a, mean_b, std_a, std_b = _mean_std_trajectories(shifted_runs)
+                ax_z.plot(mean_b, mean_a, 'o-', color=color, markersize=3.5,
+                          linewidth=1.8, label=f'{zoom_stage} mean')
+                every = max(1, len(mean_a) // 12)
+                ax_z.errorbar(mean_b[::every], mean_a[::every],
+                              xerr=std_b[::every], yerr=std_a[::every],
+                              fmt='none', ecolor=color, elinewidth=0.9,
+                              alpha=0.65, capsize=2, label=f'{zoom_stage} ±1 std')
+                zoom_alpha.extend(mean_a.tolist())
+                zoom_beta.extend(mean_b.tolist())
+
+            ax_z.scatter([off_b[-1]], [off_a[-1]], color=color, s=120, marker='*',
+                         edgecolors='k', linewidths=0.5, label=f'{zoom_stage} θ*')
+            zoom_alpha.append(off_a[-1])
+            zoom_beta.append(off_b[-1])
+            ax_z.set_xlim(_lim(zoom_beta, margin=0.18))
+            ax_z.set_ylim(_lim(zoom_alpha, margin=0.18))
+            ax_z.set_xlabel('beta  (PC2)', fontsize=11)
+            ax_z.set_ylabel('alpha (PC1)', fontsize=11)
+            ax_z.set_title(f'{zoom_stage} Trajectory Zoom\n(shared PCA coordinates)', fontsize=11)
+            ax_z.legend(fontsize=8, loc='best', framealpha=0.85)
+            ax_z.grid(True, alpha=0.25)
+            fig_z.tight_layout()
+            out_zoom = out_dir / f"trajectory_zoom{tag}.png"
+            fig_z.savefig(out_zoom, dpi=150)
+            plt.close(fig_z)
+            print(f"  Trajectory zoom plot saved: {out_zoom}")
 
 
 def plot_all_landscapes(landscapes: Dict, out_dir: Path, log_root: str = 'log'):
@@ -244,6 +360,11 @@ def sort_stages_chronologically(stages: List[str]) -> List[str]:
     return known + unknown
 
 
+def output_tag(stages: List[str]) -> str:
+    """Build a unique suffix for multi-config output files."""
+    return '' if len(stages) <= 1 else '__' + '__'.join(stages)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Loss landscape visualizer')
     parser.add_argument('--config', required=True, nargs='+',
@@ -281,10 +402,12 @@ def main():
     print(f"Loaded {len(landscapes)} stage landscape(s).\n")
     if len(stages) == 1:
         plot_all_landscapes(landscapes, out_dir, log_root='log')
+        if landscapes.get(stages[0], {}).get('runs'):
+            plot_connected_trajectories(landscapes, stages, out_dir)
     else:
         # Multi-stage: connected trajectory in shared PCA coords (no landscape contour)
         loaded_stages = [s for s in stages if s in landscapes]
-        plot_connected_trajectories(landscapes, loaded_stages, out_dir)
+        plot_connected_trajectories(landscapes, loaded_stages, out_dir, output_tag(loaded_stages))
     print(f"\nAll plots saved to {out_dir}")
 
 

@@ -19,6 +19,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from collections import defaultdict
 from typing import Dict, List
 
 import matplotlib
@@ -55,18 +56,60 @@ def load_metrics(stages: List[str], log_root: str = 'log') -> Dict[str, List[Dic
     data = {}
     for stage in stages:
         mpath = Path(log_root) / stage / 'metrics.jsonl'
-        if not mpath.exists():
+        run_paths = sorted((Path(log_root) / stage).glob('run_*/metrics.jsonl'))
+        if run_paths:
+            run_rows = [_read_metrics_jsonl(p) for p in run_paths]
+            rows = _aggregate_metric_runs(run_rows)
+            print(f"  {stage}: aggregated {len(run_paths)} run metrics file(s)")
+        elif mpath.exists():
+            rows = _read_metrics_jsonl(mpath)
+        else:
             print(f"  Warning: {mpath} not found, skipping.")
             continue
-        rows = []
-        with open(mpath) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    rows.append(json.loads(line))
         if rows:
             data[stage] = rows
     return data
+
+
+def _read_metrics_jsonl(path: Path) -> List[Dict]:
+    """Read one metrics.jsonl file."""
+    rows = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def _aggregate_metric_runs(run_rows: List[List[Dict]]) -> List[Dict]:
+    """Aggregate multiple same-stage metric runs by step using means."""
+    by_step = defaultdict(list)
+    for rows in run_rows:
+        for row in rows:
+            by_step[row['step']].append(row)
+
+    out = []
+    for step in sorted(by_step):
+        rows = by_step[step]
+        agg = {'step': step}
+        keys = sorted(set().union(*(r.keys() for r in rows)) - {'step'})
+        for key in keys:
+            vals = [r.get(key) for r in rows if r.get(key) is not None]
+            if not vals:
+                agg[key] = None
+                continue
+            if isinstance(vals[0], list):
+                arr = np.array(vals, dtype=float)
+                agg[key] = np.nanmean(arr, axis=0).round(6).tolist()
+            elif isinstance(vals[0], (int, float)):
+                arr = np.array(vals, dtype=float)
+                agg[key] = round(float(arr.mean()), 6)
+                agg[f'{key}_std'] = round(float(arr.std()), 6)
+            else:
+                agg[key] = vals[0]
+        out.append(agg)
+    return out
 
 
 def _sorted_stages(data: Dict) -> List[str]:
@@ -77,6 +120,11 @@ def _sorted_stages(data: Dict) -> List[str]:
 
 def _color(stage: str) -> str:
     return COLORS.get(stage, '#7f7f7f')
+
+
+def _output_tag(stages: List[str]) -> str:
+    """Build a unique suffix for multi-config output files."""
+    return '' if len(stages) <= 1 else '__' + '__'.join(stages)
 
 
 def _col(rows: List[Dict], key: str):
@@ -94,7 +142,7 @@ def _col(rows: List[Dict], key: str):
 # Plot A: Loss curves
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_loss_curves(data: Dict, out_dir: Path):
+def plot_loss_curves(data: Dict, out_dir: Path, tag: str = ''):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     ax_train, ax_val = axes
 
@@ -118,7 +166,7 @@ def plot_loss_curves(data: Dict, out_dir: Path):
         ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    out = out_dir / 'A_loss_curves.png'
+    out = out_dir / f"A_loss_curves{tag}.png"
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"  Plot A saved: {out}")
@@ -128,7 +176,7 @@ def plot_loss_curves(data: Dict, out_dir: Path):
 # Plot B: Reward curves (GRPO stages)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_reward_curves(data: Dict, out_dir: Path):
+def plot_reward_curves(data: Dict, out_dir: Path, tag: str = ''):
     fig, ax = plt.subplots(figsize=(8, 4))
 
     has_data = False
@@ -150,7 +198,7 @@ def plot_reward_curves(data: Dict, out_dir: Path):
     ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    out = out_dir / 'B_reward_curves.png'
+    out = out_dir / f"B_reward_curves{tag}.png"
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"  Plot B saved: {out}")
@@ -160,7 +208,7 @@ def plot_reward_curves(data: Dict, out_dir: Path):
 # Plot C: Task accuracy by depth (final checkpoint bar chart)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_acc_by_depth(data: Dict, out_dir: Path):
+def plot_acc_by_depth(data: Dict, out_dir: Path, tag: str = ''):
     stages = _sorted_stages(data)
     n      = len(stages)
     if n == 0:
@@ -199,7 +247,7 @@ def plot_acc_by_depth(data: Dict, out_dir: Path):
     ax.grid(True, axis='y', alpha=0.3)
 
     fig.tight_layout()
-    out = out_dir / 'C_acc_by_depth.png'
+    out = out_dir / f"C_acc_by_depth{tag}.png"
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"  Plot C saved: {out}")
@@ -209,7 +257,7 @@ def plot_acc_by_depth(data: Dict, out_dir: Path):
 # Plot D: Exposure bias (kl_student_prefix - kl_teacher_prefix over steps)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_exposure_bias(data: Dict, out_dir: Path):
+def plot_exposure_bias(data: Dict, out_dir: Path, tag: str = ''):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     ax_abs, ax_bias = axes
 
@@ -256,7 +304,7 @@ def plot_exposure_bias(data: Dict, out_dir: Path):
     ax_bias.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    out = out_dir / 'D_exposure_bias.png'
+    out = out_dir / f"D_exposure_bias{tag}.png"
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"  Plot D saved: {out}")
@@ -300,10 +348,11 @@ def main():
 
     print(f"Loaded {len(data)} stage(s): {list(data.keys())}\n")
 
-    plot_loss_curves(data, out_dir)
-    plot_reward_curves(data, out_dir)
-    plot_acc_by_depth(data, out_dir)
-    plot_exposure_bias(data, out_dir)
+    tag = _output_tag(stages)
+    plot_loss_curves(data, out_dir, tag)
+    plot_reward_curves(data, out_dir, tag)
+    plot_acc_by_depth(data, out_dir, tag)
+    plot_exposure_bias(data, out_dir, tag)
 
     print(f"\nAll plots saved to {out_dir}")
 
