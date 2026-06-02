@@ -22,6 +22,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -158,16 +159,46 @@ def get_lr(step: int, n_steps: int, lr: float, warmup_steps: int,
 # Temporary checkpoint (for landscape computation)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_ckpt_thread: threading.Thread = None   # global handle to the last ckpt background thread
+
+
 def save_tmp_ckpt(model: nn.Module, tmp_dir: str, step: int, dtype: str = 'float16') -> float:
-    """Save current parameters as float16 to tmp_dir/<step>.pt (used by landscape).
-    Returns elapsed seconds."""
+    """
+    Save current parameters to tmp_dir/<step>.pt (float16 by default).
+
+    The GPU->CPU copy is done synchronously in the calling thread (fast, ~1ms).
+    The actual disk write is dispatched to a background thread so it overlaps
+    with the next training steps instead of blocking them.
+
+    Returns the time spent in the calling thread (GPU copy only, not disk write).
+    """
+    global _ckpt_thread
+
     t0 = time.time()
     Path(tmp_dir).mkdir(parents=True, exist_ok=True)
     raw = getattr(model, '_orig_mod', model)  # unwrap torch.compile if needed
-    state = {k: v.half() if dtype == 'float16' else v.clone()
-             for k, v in raw.state_dict().items()}
-    torch.save(state, Path(tmp_dir) / f"{step:06d}.pt")
-    return time.time() - t0
+
+    # Copy parameters to CPU first (in calling thread: fast, forces GPU sync)
+    if dtype == 'float16':
+        state_cpu = {k: v.half().cpu() for k, v in raw.state_dict().items()}
+    else:
+        state_cpu = {k: v.cpu() for k, v in raw.state_dict().items()}
+    t_copy = time.time() - t0
+
+    # Wait for any previous background save to finish before starting a new one
+    # (avoids two concurrent writes to the same directory)
+    if _ckpt_thread is not None and _ckpt_thread.is_alive():
+        _ckpt_thread.join()
+
+    out_path = Path(tmp_dir) / f"{step:06d}.pt"
+
+    def _write(state, path):
+        torch.save(state, path)
+
+    _ckpt_thread = threading.Thread(target=_write, args=(state_cpu, out_path), daemon=True)
+    _ckpt_thread.start()
+
+    return t_copy   # only report GPU copy time; disk write runs in background
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -413,6 +444,11 @@ def main(config_path: str):
             n_ckpts_in_interval = 0
 
     metrics_file.close()
+
+    # wait for any in-flight background checkpoint write to finish
+    if _ckpt_thread is not None and _ckpt_thread.is_alive():
+        print("[timing] Waiting for background checkpoint write to finish...")
+        _ckpt_thread.join()
 
     # save final weights
     _t = time.time()
