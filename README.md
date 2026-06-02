@@ -162,7 +162,7 @@ python data.py --config config/eval_10k_depth5.yaml          # eval data
 python pretrain.py --config config/teacher_pretrain.yaml
 python sft.py      --config config/teacher_sft.yaml
 python sft_lora.py --config config/teacher_sft_lora.yaml     # 可选，SFT 的 LoRA 版本
-python grpo.py     --config config/teacher_grpo.yaml         # -> teacher_final
+python grpo.py     --config config/teacher_grpo.yaml         # pretrain -> RLVR teacher
 
 # 3. Student pipeline
 python pretrain.py --config config/student_pretrain.yaml
@@ -189,6 +189,43 @@ python inference.py --config config/teacher_sft.yaml --model path/to/override.pt
 - 配置文件名**全局唯一**；日志子目录按配置文件名建立（`log/teacher_pretrain/`）。
 - **新建训练任务必须创建新配置文件**，禁止复用已有配置（否则日志会被覆盖）。
 - 配置文件中必须包含**所有**可配置变量：数据路径、模型超参、训练超参、输出路径、日志路径、推理参数等。
+
+### 4.3 GRPO 训练实现
+
+`grpo.py` 被 teacher 和 student 共用；teacher 配置为：
+
+```yaml
+train:
+  base_model_path: log/teacher_pretrain/teacher_pretrain.pt
+  reference_model_path: log/teacher_pretrain/teacher_pretrain.pt
+  n_rollouts_per_prompt: 8
+  clip_eps: 0.2
+  kl_coeff: 0.05
+```
+
+teacher GRPO 的 policy warm-start 和 KL reference 都使用 pretrain 后的模型，不依赖 `teacher_sft.pt`。
+
+训练循环：
+
+1. 从 `data.path` 读取 rollout prompts，只保留没有 `?` 的表达式求值样本；`stmt` 和 `cot` 样本都可用，因为它们的 prompt 都是 `[BOS] EXPR`。
+2. 每步采样 `B` 个同长度 prompt，并对每个 prompt 采样 `G` 个 completion，得到 `R = B * G` 条 rollout。
+3. 从 completion 中取最后一个 `=` 后、`[EOS]` 前的数字串作为答案；答案等于解释器 `result` 时 reward = 1，否则 reward = 0。`reward_fn: partial_match` 会给正确前缀一个很小的 shaped reward。
+4. 对每个 prompt 的 `G` 个 reward 做组内标准化，作为 GRPO advantage。
+5. 重新前向当前 policy，计算 sampled-token importance ratio，并使用 `clip_eps` 做 PPO-style clipped objective。
+6. 同时在相同 completion context 上计算当前 policy 到 frozen reference 的 exact token KL，并加上 `kl_coeff * KL`。
+
+关键张量形状：
+
+```python
+prompt_ids = sample_prompts()      # prompt_ids: [B=32, Lp=18]
+full_ids = sample_rollouts()       # full_ids: [R=256, Lp+Tc=74]
+action_mask                       # action_mask: [R=256, Tc=56]
+old_logprobs                      # old_logprobs: [R=256, Tc=56]
+rewards                           # rewards: [B=32, G=8]
+advantages                        # advantages: [R=256, 1]
+```
+
+日志字段中 `mean_reward` 是 verifier 平均 reward，`kl_to_ref` 是当前 policy 相对 reference 的 token KL；`val_loss` 和 `task_acc` 仍复用统一评估集的 CE 与 greedy decode 正确率。
 
 ---
 

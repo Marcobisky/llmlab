@@ -1,12 +1,12 @@
 # Training config: teacher model GRPO alignment.
-# Requires: log/teacher_sft/teacher_sft.pt
+# Requires: log/teacher_pretrain/teacher_pretrain.pt
 # Usage: python grpo.py --config config/teacher_grpo.yaml
 #
 # Config name = log subdirectory name (log/teacher_grpo/).
 # To start a new training run, create a NEW config file — do not reuse this one.
 
 data:
-  path: data/expr_500k_depth5.jsonl    # only the prompt field is used for rollouts
+  path: data/expr_500k_depth5.jsonl    # prompt for rollouts, result for verifier reward
 
 model:
   vocab_size: 34
@@ -38,6 +38,8 @@ train:
   reward_fn: interpreter          # interpreter | partial_match
   rollout_temperature: 1.0
   loss_on_prompt: false
+  amp: true
+  amp_dtype: bf16
   seed: 42
   device: cuda
 
